@@ -6,6 +6,7 @@ import com.whosly.gateway.adapter.mysql.MySQLResultSet;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
+import java.sql.Connection;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Types;
@@ -21,7 +22,7 @@ class MySqlProtocolAdapterTest {
         
         assertThat(adapter).isNotNull();
         assertThat(adapter.getProtocolName()).isEqualTo("MySQL");
-        assertThat(adapter.getDefaultPort()).isEqualTo(3306);
+        assertThat(adapter.getDefaultPort()).isEqualTo(3307); // 更新为新的默认端口
         assertThat(adapter.isRunning()).isFalse();
     }
 
@@ -56,7 +57,9 @@ class MySqlProtocolAdapterTest {
     
     @Test
     void testHandshakePacketCreation() {
-        byte[] handshakeData = MySQLHandshake.createHandshakePacket();
+        // 创建一个模拟的数据库连接用于测试
+        Connection mockConnection = mock(Connection.class);
+        byte[] handshakeData = MySQLHandshake.createHandshakePacket(mockConnection);
         assertThat(handshakeData).isNotNull();
         assertThat(handshakeData.length).isGreaterThan(0);
     }

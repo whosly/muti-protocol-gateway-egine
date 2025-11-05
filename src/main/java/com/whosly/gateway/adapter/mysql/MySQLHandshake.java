@@ -4,7 +4,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Random;
+import java.security.SecureRandom;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.SQLException;
+import java.util.Arrays;
 
 /**
  * MySQL握手和认证处理类
@@ -13,8 +17,10 @@ public class MySQLHandshake {
     private static final String SERVER_VERSION = "5.7.25";
     private static final int PROTOCOL_VERSION = 10;
     private static final int CONNECTION_ID = 1;
-    private static final byte[] AUTH_PLUGIN_DATA_PART1 = new byte[]{1, 2, 3, 4, 5, 6, 7, 8};
-    private static final byte[] AUTH_PLUGIN_DATA_PART2 = new byte[]{9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+    
+    // 使用随机生成的认证数据
+    private static final byte[] AUTH_PLUGIN_DATA_PART1 = generateRandomBytes(8);
+    private static final byte[] AUTH_PLUGIN_DATA_PART2 = generateRandomBytes(12);
     private static final String AUTH_PLUGIN_NAME = "mysql_native_password";
     
     // MySQL能力标志
@@ -34,15 +40,62 @@ public class MySQLHandshake {
     private static final int CLIENT_TRANSACTIONS = 0x2000;
     private static final int CLIENT_RESERVED = 0x4000;
     private static final int CLIENT_SECURE_CONNECTION = 0x8000;
+    private static final int CLIENT_MULTI_STATEMENTS = 0x10000;
+    private static final int CLIENT_MULTI_RESULTS = 0x20000;
+    private static final int CLIENT_PS_MULTI_RESULTS = 0x40000;
+    private static final int CLIENT_PLUGIN_AUTH = 0x80000;
+    private static final int CLIENT_CONNECT_ATTRS = 0x100000;
+    private static final int CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x200000;
+    private static final int CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS = 0x400000;
+    private static final int CLIENT_SESSION_TRACK = 0x800000;
+    private static final int CLIENT_DEPRECATE_EOF = 0x1000000;
     
     private static final int SERVER_STATUS_AUTOCOMMIT = 0x0002;
+    
+    // 服务器能力标志
+    private static final int SERVER_SSL = 0x0800;
+    
+    // 生成随机字节的辅助方法
+    private static byte[] generateRandomBytes(int length) {
+        byte[] bytes = new byte[length];
+        new SecureRandom().nextBytes(bytes);
+        // 确保没有null字节，因为null用作字符串终止符
+        for (int i = 0; i < bytes.length; i++) {
+            if (bytes[i] == 0) {
+                bytes[i] = (byte) (Math.random() * 127 + 1); // 1-127之间的非零值
+            }
+        }
+        return bytes;
+    }
+    
+    /**
+     * 获取数据库版本
+     * 
+     * @param connection 数据库连接
+     * @return 数据库版本字符串
+     */
+    private static String getDatabaseVersion(Connection connection) {
+        try {
+            if (connection != null && !connection.isClosed()) {
+                DatabaseMetaData metaData = connection.getMetaData();
+                return metaData.getDatabaseProductVersion();
+            }
+        } catch (SQLException e) {
+            // 如果无法获取版本信息，使用默认版本
+            e.printStackTrace();
+        }
+        return "5.7.25"; // 默认版本
+    }
     
     /**
      * 创建服务器握手初始化包
      * 
+     * @param connection 数据库连接，用于获取实际的数据库版本
      * @return 握手初始化包的载荷
      */
-    public static byte[] createHandshakePacket() {
+    public static byte[] createHandshakePacket(Connection connection) {
+        String serverVersion = getDatabaseVersion(connection);
+        
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         
         try {
@@ -50,7 +103,7 @@ public class MySQLHandshake {
             baos.write(PROTOCOL_VERSION);
             
             // 服务器版本
-            baos.write(SERVER_VERSION.getBytes());
+            baos.write(serverVersion.getBytes());
             baos.write(0); // 字符串结束符
             
             // 连接ID
@@ -68,7 +121,11 @@ public class MySQLHandshake {
                                  CLIENT_ODBC | CLIENT_LOCAL_FILES | CLIENT_IGNORE_SPACE |
                                  CLIENT_PROTOCOL_41 | CLIENT_INTERACTIVE | CLIENT_SSL |
                                  CLIENT_IGNORE_SIGPIPE | CLIENT_TRANSACTIONS | CLIENT_RESERVED |
-                                 CLIENT_SECURE_CONNECTION;
+                                 CLIENT_SECURE_CONNECTION | CLIENT_MULTI_STATEMENTS | 
+                                 CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS | CLIENT_PLUGIN_AUTH |
+                                 CLIENT_CONNECT_ATTRS | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA |
+                                 CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS | CLIENT_SESSION_TRACK |
+                                 CLIENT_DEPRECATE_EOF;
             writeInt2(baos, capabilityFlags & 0xFFFF);
             
             // 字符集
@@ -81,7 +138,7 @@ public class MySQLHandshake {
             writeInt2(baos, (capabilityFlags >> 16) & 0xFFFF);
             
             // 认证插件数据长度
-            baos.write(21); // AUTH_PLUGIN_DATA_PART1.length + AUTH_PLUGIN_DATA_PART2.length + 1
+            baos.write(AUTH_PLUGIN_DATA_PART1.length + AUTH_PLUGIN_DATA_PART2.length + 1);
             
             // 保留的10个字节
             for (int i = 0; i < 10; i++) {
@@ -104,64 +161,166 @@ public class MySQLHandshake {
     }
     
     /**
+     * 创建SSL握手响应包
+     * 
+     * @param sequenceId 序列号
+     * @return SSL握手响应包
+     */
+    public static byte[] createSSLHandshakeResponse(int sequenceId) {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        
+        try {
+            // 能力标志低16位
+            int capabilityFlags = CLIENT_LONG_PASSWORD | CLIENT_FOUND_ROWS | CLIENT_LONG_FLAG |
+                                 CLIENT_CONNECT_WITH_DB | CLIENT_NO_SCHEMA | CLIENT_COMPRESS |
+                                 CLIENT_ODBC | CLIENT_LOCAL_FILES | CLIENT_IGNORE_SPACE |
+                                 CLIENT_PROTOCOL_41 | CLIENT_INTERACTIVE | CLIENT_SSL |
+                                 CLIENT_IGNORE_SIGPIPE | CLIENT_TRANSACTIONS | CLIENT_RESERVED |
+                                 CLIENT_SECURE_CONNECTION | CLIENT_MULTI_STATEMENTS | 
+                                 CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS | CLIENT_PLUGIN_AUTH |
+                                 CLIENT_CONNECT_ATTRS | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA |
+                                 CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS | CLIENT_SESSION_TRACK |
+                                 CLIENT_DEPRECATE_EOF;
+            writeInt2(baos, capabilityFlags & 0xFFFF);
+            
+            // 最大包大小
+            writeInt4(baos, 16777216); // 16MB
+            
+            // 字符集
+            baos.write(0x21); // utf8_general_ci
+            
+            // 23字节的保留字段
+            for (int i = 0; i < 23; i++) {
+                baos.write(0);
+            }
+            
+            return MySQLPacket.createPacket(baos.toByteArray(), sequenceId);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create SSL handshake response", e);
+        }
+    }
+    
+    /**
      * 解析客户端认证包
      * 
      * @param payload 认证包载荷
      * @return 认证信息
      */
     public static AuthInfo parseAuthPacket(byte[] payload) {
-        // 这是一个简化的实现，实际的解析需要处理更多字段
         AuthInfo authInfo = new AuthInfo();
         
         try {
             int pos = 0;
             
             // 能力标志低16位 (4 bytes)
+            if (pos + 4 > payload.length) {
+                throw new RuntimeException("Packet too short for client capabilities");
+            }
             int clientCapabilities = readInt4(payload, pos);
             pos += 4;
             
             // 最大包大小 (4 bytes)
+            if (pos + 4 > payload.length) {
+                throw new RuntimeException("Packet too short for max packet size");
+            }
             int maxPacketSize = readInt4(payload, pos);
             pos += 4;
             
             // 字符集 (1 byte)
+            if (pos >= payload.length) {
+                throw new RuntimeException("Packet too short for charset");
+            }
             int charset = payload[pos] & 0xFF;
             pos += 1;
             
             // 跳过23个保留字节
+            if (pos + 23 > payload.length) {
+                throw new RuntimeException("Packet too short for reserved bytes");
+            }
             pos += 23;
+            
+            // 检查是否是SSL请求
+            if ((clientCapabilities & CLIENT_SSL) != 0 && payload.length == 32) {
+                // 这是一个SSL请求包，不是完整的认证包
+                authInfo.setSSLRequest(true);
+                return authInfo;
+            }
             
             // 用户名 (以null结尾)
             int usernameStart = pos;
             while (pos < payload.length && payload[pos] != 0) {
                 pos++;
             }
+            if (pos >= payload.length) {
+                throw new RuntimeException("Packet too short for username");
+            }
             String username = new String(payload, usernameStart, pos - usernameStart);
             pos++; // 跳过null终止符
             
-            // 密码长度编码
+            // 密码长度和内容
             if (pos < payload.length) {
-                long passwordLength = readLengthEncodedInteger(payload, pos);
-                pos += getLengthEncodedIntegerSize(passwordLength);
+                // 检查是否使用了CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA标志
+                boolean useLenEnc = (clientCapabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) != 0;
                 
-                // 跳过密码字段
-                pos += (int) passwordLength;
+                if (useLenEnc) {
+                    // 使用长度编码的整数
+                    if (pos >= payload.length) {
+                        throw new RuntimeException("Packet too短 for password length");
+                    }
+                    long passwordLength = readLengthEncodedInteger(payload, pos);
+                    pos += getLengthEncodedIntegerSize(passwordLength);
+                    
+                    // 跳过密码字段
+                    if (pos + passwordLength > payload.length) {
+                        throw new RuntimeException("Packet too短 for password");
+                    }
+                    pos += (int) passwordLength;
+                } else {
+                    // 使用旧的固定长度方式
+                    if (pos >= payload.length) {
+                        throw new RuntimeException("Packet too短 for password");
+                    }
+                    int passwordLength = payload[pos] & 0xFF;
+                    pos++;
+                    
+                    if (pos + passwordLength > payload.length) {
+                        throw new RuntimeException("Packet too短 for password");
+                    }
+                    pos += passwordLength;
+                }
             }
             
-            // 数据库名称 (以null结尾)
-            if (pos < payload.length) {
+            // 数据库名称 (只有当设置了CLIENT_CONNECT_WITH_DB标志时才存在)
+            if ((clientCapabilities & CLIENT_CONNECT_WITH_DB) != 0 && pos < payload.length) {
                 int dbnameStart = pos;
                 while (pos < payload.length && payload[pos] != 0) {
                     pos++;
                 }
-                String database = new String(payload, dbnameStart, pos - dbnameStart);
-                authInfo.setDatabase(database);
+                if (pos <= payload.length) {
+                    String database = new String(payload, dbnameStart, pos - dbnameStart);
+                    authInfo.setDatabase(database);
+                }
+                if (pos < payload.length) {
+                    pos++; // 跳过null终止符
+                }
+            }
+            
+            // 认证插件名称 (只有当设置了CLIENT_PLUGIN_AUTH标志时才存在)
+            if ((clientCapabilities & CLIENT_PLUGIN_AUTH) != 0 && pos < payload.length) {
+                int pluginNameStart = pos;
+                while (pos < payload.length && payload[pos] != 0) {
+                    pos++;
+                }
+                // 不需要保存插件名称，只需要跳过
+                if (pos < payload.length) {
+                    pos++; // 跳过null终止符
+                }
             }
             
             authInfo.setUsername(username);
             
         } catch (Exception e) {
-            throw new RuntimeException("Failed to parse auth packet", e);
+            throw new RuntimeException("Failed to parse auth packet: " + e.getMessage(), e);
         }
         
         return authInfo;
@@ -331,6 +490,7 @@ public class MySQLHandshake {
     public static class AuthInfo {
         private String username;
         private String database;
+        private boolean sslRequest = false;
         
         public String getUsername() {
             return username;
@@ -346,6 +506,19 @@ public class MySQLHandshake {
         
         public void setDatabase(String database) {
             this.database = database;
+        }
+        
+        public boolean isSSLRequest() {
+            return sslRequest;
+        }
+        
+        public void setSSLRequest(boolean sslRequest) {
+            this.sslRequest = sslRequest;
+        }
+        
+        @Override
+        public String toString() {
+            return "AuthInfo{username='" + username + "', database='" + database + "', sslRequest=" + sslRequest + "}";
         }
     }
 }

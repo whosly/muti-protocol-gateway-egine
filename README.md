@@ -1,6 +1,6 @@
 # Multi-Protocol Database Gateway Engine
 
-This is a proxy gateway engine that implements multiple database protocols. It uses Alibaba Druid for SQL parsing and is developed in Java 17.
+This is a proxy gateway engine that implements multiple database protocols. It uses SQL parsing and is developed in Java 17.
 
 ## Overview
 

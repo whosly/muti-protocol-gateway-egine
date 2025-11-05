@@ -1,5 +1,5 @@
-server:
-  port: 8080
+﻿server:
+  port: 0  # 使用随机端口
 
 spring:
   application:
@@ -12,16 +12,19 @@ logging:
     console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
 
 gateway:
-  protocols:
-    mysql:
-      enabled: true
-      port: 3307
-    postgresql:
-      enabled: true
-      port: 5432
-    oracle:
-      enabled: false
-      port: 1521
+  # 数据库类型配置
+  proxy-db-type: mysql
+  # 代理端口
+  proxy-port: 3307
+
+  # 目标数据库配置
+  target:
+    host: localhost
+    port: 13308
+    username: root
+    password: Aa123456.
+    database: demo
+
   connection:
     pool:
       initial-size: 5

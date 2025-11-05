@@ -31,6 +31,13 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     private com.whosly.gateway.service.DatabaseConnectionService databaseConnectionService;
     private int port = DEFAULT_PORT;
     
+    // 目标数据库配置
+    private String targetHost = "localhost";
+    private int targetPort = 3306;
+    private String targetUsername = "root";
+    private String targetPassword = "password";
+    private String targetDatabase = "testdb";
+    
     public MySqlProtocolAdapter() {
         this.sqlParser = new com.whosly.gateway.parser.DruidSqlParser();
         this.databaseConnectionService = new com.whosly.gateway.service.DatabaseConnectionService();
@@ -42,6 +49,27 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     
     public int getPort() {
         return this.port;
+    }
+    
+    // 目标数据库配置的setter方法
+    public void setTargetHost(String targetHost) {
+        this.targetHost = targetHost;
+    }
+    
+    public void setTargetPort(int targetPort) {
+        this.targetPort = targetPort;
+    }
+    
+    public void setTargetUsername(String targetUsername) {
+        this.targetUsername = targetUsername;
+    }
+    
+    public void setTargetPassword(String targetPassword) {
+        this.targetPassword = targetPassword;
+    }
+    
+    public void setTargetDatabase(String targetDatabase) {
+        this.targetDatabase = targetDatabase;
     }
 
     @Override
@@ -135,40 +163,72 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     private void handleClientConnection(Socket clientSocket) {
         Connection backendConnection = null;
         try {
+            log.info("Handling new client connection from {}", clientSocket.getRemoteSocketAddress());
+            
             // Get input/output streams for client
             InputStream clientIn = clientSocket.getInputStream();
             OutputStream clientOut = clientSocket.getOutputStream();
             
-            // Perform MySQL handshake
-            performHandshake(clientIn, clientOut);
+            // First, connect to the backend database to get version information
+            String dbUrl = String.format("jdbc:mysql://%s:%d/%s", targetHost, targetPort, targetDatabase);
+            String username = targetUsername;
+            String password = targetPassword;
+            
+            log.info("Connecting to backend database: {} with user: {}", dbUrl, username);
+            backendConnection = databaseConnectionService.connectToDatabase(dbUrl, username, password);
+            log.info("Successfully connected to backend database: {}", dbUrl);
+            
+            // Perform MySQL handshake with actual database version
+            log.debug("Performing MySQL handshake");
+            performHandshake(clientIn, clientOut, backendConnection);
+            log.debug("MySQL handshake completed");
             
             // Authenticate with backend database
+            log.debug("Authenticating client");
             MySQLHandshake.AuthInfo authInfo = authenticateClient(clientIn, clientOut);
+            log.debug("Client authentication completed, authInfo: {}", authInfo);
+            
+            // 检查是否是SSL请求
+            if (authInfo != null && authInfo.isSSLRequest()) {
+                log.debug("SSL request received, switching to SSL mode");
+                // 在实际实现中，这里应该切换到SSL模式
+                // 为简化起见，我们直接返回错误
+                byte[] errorPacket = MySQLHandshake.createErrorPacket(1045, "28000", "SSL not supported", 1);
+                clientOut.write(errorPacket);
+                clientOut.flush();
+                return;
+            }
+            
             if (authInfo != null) {
-                // For now, we'll prompt for database connection details
-                // In a real implementation, we would use the authInfo to connect to a configured database
-                String[] dbConnectionInfo = getDatabaseConnectionInfo(clientIn, clientOut);
-                if (dbConnectionInfo != null) {
-                    String dbUrl = dbConnectionInfo[0];
-                    String username = dbConnectionInfo[1];
-                    String password = dbConnectionInfo[2];
-                    
-                    // Connect to the backend database
-                    backendConnection = databaseConnectionService.connectToDatabase(dbUrl, username, password);
-                    log.info("Successfully connected to backend database: {}", dbUrl);
-                    
-                    // Send OK packet to client
-                    byte[] okPacket = MySQLHandshake.createOkPacket(2);
-                    clientOut.write(okPacket);
-                    clientOut.flush();
-                    
-                    // Proxy communication between client and backend
-                    proxyConnection(clientSocket, clientIn, clientOut, backendConnection);
-                }
+                // Send OK packet to client
+                log.debug("Sending OK packet to client");
+                byte[] okPacket = MySQLHandshake.createOkPacket(2);
+                clientOut.write(okPacket);
+                clientOut.flush();
+                log.debug("OK packet sent to client");
+                
+                // Proxy communication between client and backend
+                log.info("Starting proxy communication");
+                proxyConnection(clientSocket, clientIn, clientOut, backendConnection);
+                log.info("Proxy communication ended");
+            } else {
+                log.warn("Client authentication failed");
+                // 发送认证失败错误包
+                byte[] errorPacket = MySQLHandshake.createErrorPacket(1045, "28000", "Access denied", 1);
+                clientOut.write(errorPacket);
+                clientOut.flush();
             }
         } catch (Exception e) {
-            log.error("Error handling MySQL client connection", e);
+            log.error("Error handling MySQL client connection from {}", clientSocket.getRemoteSocketAddress(), e);
             try {
+                // 尝试发送错误包给客户端
+                try {
+                    byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Connection Error: " + e.getMessage(), 1);
+                    clientSocket.getOutputStream().write(errorPacket);
+                    clientSocket.getOutputStream().flush();
+                } catch (Exception innerException) {
+                    log.debug("Failed to send error packet to client: {}", innerException.getMessage());
+                }
                 clientSocket.close();
             } catch (IOException ioException) {
                 log.error("Error closing client socket", ioException);
@@ -176,10 +236,21 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
         } finally {
             if (backendConnection != null) {
                 try {
+                    log.debug("Closing backend connection");
                     backendConnection.close();
+                    log.debug("Backend connection closed");
                 } catch (SQLException e) {
                     log.error("Error closing backend connection", e);
                 }
+            }
+            try {
+                if (!clientSocket.isClosed()) {
+                    log.debug("Closing client socket");
+                    clientSocket.close();
+                    log.debug("Client socket closed");
+                }
+            } catch (IOException e) {
+                log.error("Error closing client socket", e);
             }
         }
     }
@@ -187,9 +258,9 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     /**
      * Perform the initial MySQL protocol handshake.
      */
-    private void performHandshake(InputStream clientIn, OutputStream clientOut) throws IOException {
-        // Create and send server greeting packet
-        byte[] handshakeData = MySQLHandshake.createHandshakePacket();
+    private void performHandshake(InputStream clientIn, OutputStream clientOut, Connection backendConnection) throws IOException {
+        // Create and send server greeting packet with actual database version
+        byte[] handshakeData = MySQLHandshake.createHandshakePacket(backendConnection);
         byte[] handshakePacket = MySQLPacket.createPacket(handshakeData, 0);
         
         clientOut.write(handshakePacket);
@@ -211,102 +282,411 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     }
     
     /**
-     * Get database connection information from client.
-     * 
-     * @return array with [dbUrl, username, password] or null if failed
-     */
-    private String[] getDatabaseConnectionInfo(InputStream clientIn, OutputStream clientOut) throws IOException {
-        // For simplicity, we'll prompt the client for database connection details
-        // In a real implementation, this would use the authentication information
-        PrintWriter writer = new PrintWriter(clientOut, true);
-        BufferedReader reader = new BufferedReader(new InputStreamReader(clientIn));
-        
-        writer.println("Connected to Multi-Protocol Database Gateway");
-        writer.println("Please provide database connection details:");
-        writer.println("Database URL (e.g., jdbc:mysql://localhost:3306/mydb): ");
-        
-        String dbUrl = reader.readLine();
-        if (dbUrl == null) return null;
-        
-        writer.println("Username: ");
-        String username = reader.readLine();
-        if (username == null) return null;
-        
-        writer.println("Password: ");
-        String password = reader.readLine();
-        if (password == null) return null;
-        
-        return new String[]{dbUrl, username, password};
-    }
-    
-    /**
      * Proxy communication between client and backend database.
      */
     private void proxyConnection(Socket clientSocket, InputStream clientIn, OutputStream clientOut, Connection backendConnection) throws IOException {
-        String inputLine;
-        BufferedReader reader = new BufferedReader(new InputStreamReader(clientIn));
-        
-        while ((inputLine = reader.readLine()) != null) {
-            if ("quit".equalsIgnoreCase(inputLine)) {
-                break;
+        try {
+            while (!clientSocket.isClosed() && !Thread.currentThread().isInterrupted()) {
+                try {
+                    // 读取客户端发送的数据包
+                    MySQLPacket.PacketInfo packetInfo = MySQLPacket.readPacket(clientIn);
+                    byte[] packetData = packetInfo.getPayload();
+                    int sequenceId = packetInfo.getSequenceId();
+                    
+                    // 检查包类型
+                    if (packetData.length > 0) {
+                        int command = packetData[0] & 0xFF;
+                        
+                        switch (command) {
+                            case 0x01: // COM_QUIT
+                                log.info("Received COM_QUIT command, closing connection");
+                                return;
+                                
+                            case 0x02: // COM_INIT_DB
+                                handleInitDbCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x03: // COM_QUERY
+                                // 处理SQL查询命令
+                                handleQueryCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x04: // COM_FIELD_LIST
+                                handleFieldListCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x05: // COM_CREATE_DB
+                                handleCreateDbCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x06: // COM_DROP_DB
+                                handleDropDbCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x08: // COM_REFRESH
+                                handleRefreshCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x09: // COM_STATISTICS
+                                // 返回统计信息
+                                handleStatisticsCommand(sequenceId, clientOut);
+                                break;
+                                
+                            case 0x0A: // COM_PROCESS_INFO
+                                handleProcessInfoCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x0B: // COM_CONNECT
+                                handleConnectCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x0C: // COM_PROCESS_KILL
+                                handleProcessKillCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x0D: // COM_DEBUG
+                                handleDebugCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x0E: // COM_PING
+                                handlePingCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            case 0x11: // COM_CHANGE_USER
+                                handleChangeUserCommand(packetData, sequenceId, clientOut, backendConnection);
+                                break;
+                                
+                            default:
+                                // 对于其他命令，返回一个OK包
+                                log.debug("Received command: 0x{}, returning OK packet", Integer.toHexString(command));
+                                byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+                                clientOut.write(okPacket);
+                                clientOut.flush();
+                                break;
+                        }
+                    }
+                } catch (IOException e) {
+                    // 客户端断开连接是正常情况，不需要记录错误日志
+                    if (!clientSocket.isClosed()) {
+                        log.debug("Client connection closed: {}", e.getMessage());
+                    }
+                    return;
+                } catch (Exception e) {
+                    log.error("Error processing client command", e);
+                    // 发送错误包给客户端
+                    try {
+                        byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Server Error: " + e.getMessage(), 1);
+                        clientOut.write(errorPacket);
+                        clientOut.flush();
+                    } catch (IOException ioException) {
+                        log.debug("Failed to send error packet to client: {}", ioException.getMessage());
+                    }
+                    // 继续处理其他命令
+                }
             }
-            
+        } finally {
+            // 确保关闭客户端连接
             try {
-                // Execute SQL command on backend database
-                Statement stmt = backendConnection.createStatement();
-                boolean hasResultSet = stmt.execute(inputLine);
+                if (!clientSocket.isClosed()) {
+                    clientSocket.close();
+                }
+            } catch (IOException e) {
+                log.debug("Error closing client socket: {}", e.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * 处理COM_INIT_DB命令
+     */
+    private void handleInitDbCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 提取数据库名称（去掉命令字节）
+            String databaseName = new String(packetData, 1, packetData.length - 1);
+            log.info("Changing to database: {}", databaseName);
+            
+            // 在实际实现中，这里应该切换到指定的数据库
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_INIT_DB command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_FIELD_LIST命令
+     */
+    private void handleFieldListCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该返回表的字段列表
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_FIELD_LIST command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_CREATE_DB命令
+     */
+    private void handleCreateDbCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 提取数据库名称（去掉命令字节）
+            String databaseName = new String(packetData, 1, packetData.length - 1);
+            log.info("Creating database: {}", databaseName);
+            
+            // 在实际实现中，这里应该创建数据库
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_CREATE_DB command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_DROP_DB命令
+     */
+    private void handleDropDbCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 提取数据库名称（去掉命令字节）
+            String databaseName = new String(packetData, 1, packetData.length - 1);
+            log.info("Dropping database: {}", databaseName);
+            
+            // 在实际实现中，这里应该删除数据库
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_DROP_DB command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_REFRESH命令
+     */
+    private void handleRefreshCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该刷新服务器缓存
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_REFRESH command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_PROCESS_INFO命令
+     */
+    private void handleProcessInfoCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该返回进程信息
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_PROCESS_INFO command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_CONNECT命令
+     */
+    private void handleConnectCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该处理连接命令
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_CONNECT command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_PROCESS_KILL命令
+     */
+    private void handleProcessKillCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该杀死指定的进程
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_PROCESS_KILL command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_DEBUG命令
+     */
+    private void handleDebugCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该输出调试信息
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_DEBUG command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_PING命令
+     */
+    private void handlePingCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            log.debug("Received COM_PING command");
+            // 返回OK包表示服务器存活
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_PING command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_CHANGE_USER命令
+     */
+    private void handleChangeUserCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 在实际实现中，这里应该处理用户切换
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_CHANGE_USER command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_QUERY命令
+     */
+    private void handleQueryCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 提取SQL查询语句（去掉命令字节）
+            String sqlQuery = new String(packetData, 1, packetData.length - 1);
+            log.info("Received SQL query: {}", sqlQuery);
+            
+            // 执行SQL查询
+            Statement stmt = backendConnection.createStatement();
+            boolean hasResultSet = stmt.execute(sqlQuery);
+            
+            if (hasResultSet) {
+                ResultSet rs = stmt.getResultSet();
+                ResultSetMetaData metaData = rs.getMetaData();
+                int columnCount = metaData.getColumnCount();
                 
-                if (hasResultSet) {
-                    ResultSet rs = stmt.getResultSet();
-                    ResultSetMetaData metaData = rs.getMetaData();
-                    int columnCount = metaData.getColumnCount();
-                    
-                    // Send column count packet
-                    byte[] columnCountPacket = MySQLResultSet.createColumnCountPacket(metaData, columnCount, 1);
-                    clientOut.write(columnCountPacket);
-                    clientOut.flush();
-                    
-                    // Send column definition packets
-                    for (int i = 1; i <= columnCount; i++) {
-                        byte[] columnDefPacket = MySQLResultSet.createColumnDefinitionPacket(metaData, i, i);
-                        clientOut.write(columnDefPacket);
-                        clientOut.flush();
-                    }
-                    
-                    // Send EOF packet after column definitions
-                    byte[] eofPacket1 = MySQLResultSet.createEofPacket(columnCount + 1);
-                    clientOut.write(eofPacket1);
-                    clientOut.flush();
-                    
-                    // Send row data packets
-                    int sequenceId = columnCount + 2;
-                    while (rs.next()) {
-                        byte[] rowDataPacket = MySQLResultSet.createRowDataPacket(rs, metaData, columnCount, sequenceId++);
-                        clientOut.write(rowDataPacket);
-                        clientOut.flush();
-                    }
-                    
-                    // Send final EOF packet
-                    byte[] eofPacket2 = MySQLResultSet.createEofPacket(sequenceId);
-                    clientOut.write(eofPacket2);
-                    clientOut.flush();
-                    
-                    rs.close();
-                } else {
-                    int updateCount = stmt.getUpdateCount();
-                    // Send OK packet for update statements
-                    byte[] okPacket = MySQLHandshake.createOkPacket(1);
-                    clientOut.write(okPacket);
+                // Send column count packet
+                byte[] columnCountPacket = MySQLResultSet.createColumnCountPacket(metaData, columnCount, sequenceId + 1);
+                clientOut.write(columnCountPacket);
+                clientOut.flush();
+                
+                // Send column definition packets
+                for (int i = 1; i <= columnCount; i++) {
+                    byte[] columnDefPacket = MySQLResultSet.createColumnDefinitionPacket(metaData, i, sequenceId + 1 + i);
+                    clientOut.write(columnDefPacket);
                     clientOut.flush();
                 }
                 
-                stmt.close();
-            } catch (SQLException e) {
-                // Send error packet
-                byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "SQL Error: " + e.getMessage(), 1);
-                clientOut.write(errorPacket);
+                // Send EOF packet after column definitions
+                byte[] eofPacket1 = MySQLResultSet.createEofPacket(sequenceId + 1 + columnCount + 1);
+                clientOut.write(eofPacket1);
+                clientOut.flush();
+                
+                // Send row data packets
+                int rowSequenceId = sequenceId + 1 + columnCount + 2;
+                while (rs.next()) {
+                    byte[] rowDataPacket = MySQLResultSet.createRowDataPacket(rs, metaData, columnCount, rowSequenceId++);
+                    clientOut.write(rowDataPacket);
+                    clientOut.flush();
+                }
+                
+                // Send final EOF packet
+                byte[] eofPacket2 = MySQLResultSet.createEofPacket(rowSequenceId);
+                clientOut.write(eofPacket2);
+                clientOut.flush();
+                
+                rs.close();
+            } else {
+                int updateCount = stmt.getUpdateCount();
+                // Send OK packet for update statements
+                byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+                clientOut.write(okPacket);
                 clientOut.flush();
             }
+            
+            stmt.close();
+        } catch (SQLException e) {
+            // Send error packet
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "SQL Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_STATISTICS命令
+     */
+    private void handleStatisticsCommand(int sequenceId, OutputStream clientOut) throws IOException {
+        try {
+            // 在实际实现中，这里应该返回服务器统计信息
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_STATISTICS command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
         }
     }
 }

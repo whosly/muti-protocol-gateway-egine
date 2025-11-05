@@ -13,7 +13,7 @@ import org.springframework.context.event.EventListener;
  * Main application class for the Multi-Protocol Database Gateway Engine.
  * 
  * This gateway engine provides unified access to various database systems
- * through different protocols, using Alibaba Druid for SQL parsing.
+ * through different protocols, using SQL parsing.
  */
 @SpringBootApplication
 public class Application {
@@ -21,10 +21,14 @@ public class Application {
     private static final Logger log = LoggerFactory.getLogger(Application.class);
 
     @Autowired
-    private com.whosly.gateway.adapter.ProtocolAdapter mySqlProtocolAdapter;
+    private com.whosly.gateway.adapter.ProtocolAdapter protocolAdapter;
     
-    @Value("${gateway.protocols.mysql.enabled:true}")
-    private boolean mysqlEnabled;
+    @Value("${gateway.proxy-db-type:mysql}")
+    private String proxyDbType;
+    
+    // 注入GatewayConfig以获取目标数据库配置信息
+    @Autowired
+    private com.whosly.gateway.config.GatewayConfig gatewayConfig;
 
     public static void main(String[] args) {
         SpringApplication.run(Application.class, args);
@@ -33,12 +37,39 @@ public class Application {
     
     @EventListener
     public void onApplicationEvent(ContextRefreshedEvent event) {
-        // Start the MySQL protocol adapter when the application context is refreshed
-        if (mysqlEnabled && !mySqlProtocolAdapter.isRunning()) {
-            log.info("Starting MySQL protocol adapter...");
-            mySqlProtocolAdapter.start();
-        } else if (!mysqlEnabled) {
-            log.info("MySQL protocol adapter is disabled in configuration");
-        }
+        // Start the protocol adapter when the application context is refreshed
+        log.info("Starting {} protocol adapter...", proxyDbType.toUpperCase());
+        protocolAdapter.start();
+        
+        // 输出代理地址信息和目标数据库信息
+        logInfo();
+    }
+    
+    /**
+     * 输出代理地址信息和目标数据库信息
+     */
+    private void logInfo() {
+        // 输出代理信息
+        log.info("{} Protocol Proxy Info:", proxyDbType.toUpperCase());
+        log.info("  Proxy Address: localhost:{}", protocolAdapter.getDefaultPort());
+        
+        // 输出目标数据库信息
+        log.info("Target Database Info:");
+        log.info("  Host: {}", gatewayConfig.getTargetHost());
+        log.info("  Port: {}", gatewayConfig.getTargetPort());
+        log.info("  Username: {}", gatewayConfig.getTargetUsername());
+        log.info("  Database: {}", gatewayConfig.getTargetDatabase());
+        
+        // 调试信息，显示实际的配置值
+        log.info("=== Configuration Debug Info ===");
+        log.info("Proxy DB Type: {}", gatewayConfig.getProxyDbType());
+        log.info("Proxy Port: {}", gatewayConfig.getProxyPort());
+        log.info("Target Host (from config): {}", gatewayConfig.getTargetHost());
+        log.info("Target Port (from config): {}", gatewayConfig.getTargetPort());
+        log.info("Target Username (from config): {}", gatewayConfig.getTargetUsername());
+        log.info("Target Database (from config): {}", gatewayConfig.getTargetDatabase());
+        log.info("=== End Configuration Debug Info ===");
+        
+        // 注意：出于安全考虑，不输出密码
     }
 }
