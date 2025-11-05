@@ -1,0 +1,32 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: multi-protocol-gateway-engine
+
+logging:
+  level:
+    com.whosly.gateway: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+gateway:
+  protocols:
+    mysql:
+      enabled: true
+      port: 3307
+    postgresql:
+      enabled: true
+      port: 5432
+    oracle:
+      enabled: false
+      port: 1521
+  connection:
+    pool:
+      initial-size: 5
+      max-size: 20
+      min-idle: 2
+  security:
+    authentication:
+      enabled: true
