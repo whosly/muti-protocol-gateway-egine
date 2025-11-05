@@ -1,5 +1,7 @@
 package com.whosly.gateway;
 
+import com.whosly.gateway.adapter.ProtocolAdapter;
+import com.whosly.gateway.config.GatewayConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -13,7 +15,7 @@ import org.springframework.context.event.EventListener;
  * Main application class for the Multi-Protocol Database Gateway Engine.
  * 
  * This gateway engine provides unified access to various database systems
- * through different protocols, using SQL parsing.
+ * through different protocols, using Alibaba Druid for SQL parsing.
  */
 @SpringBootApplication
 public class Application {
@@ -21,18 +23,17 @@ public class Application {
     private static final Logger log = LoggerFactory.getLogger(Application.class);
 
     @Autowired
-    private com.whosly.gateway.adapter.ProtocolAdapter protocolAdapter;
+    private ProtocolAdapter protocolAdapter;
     
     @Value("${gateway.proxy-db-type:mysql}")
     private String proxyDbType;
     
     // 注入GatewayConfig以获取目标数据库配置信息
     @Autowired
-    private com.whosly.gateway.config.GatewayConfig gatewayConfig;
-
+    private GatewayConfig gatewayConfig;
+    
     public static void main(String[] args) {
         SpringApplication.run(Application.class, args);
-        log.info("Multi-Protocol Database Gateway Engine started successfully");
     }
     
     @EventListener
