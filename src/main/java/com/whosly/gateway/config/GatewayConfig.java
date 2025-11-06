@@ -1,6 +1,7 @@
 package com.whosly.gateway.config;
 
 import com.whosly.gateway.adapter.MySqlProtocolAdapter;
+import com.whosly.gateway.adapter.PostgreSQLProtocolAdapter;
 import com.whosly.gateway.adapter.ProtocolAdapter;
 import com.whosly.gateway.parser.DruidSqlParser;
 import com.whosly.gateway.parser.SqlParser;
@@ -47,8 +48,7 @@ public class GatewayConfig {
             case "mysql":
                 return createMySqlProtocolAdapter();
             case "postgresql":
-                // 未来可以支持PostgreSQL
-                return createMySqlProtocolAdapter(); // 临时返回MySQL适配器
+                return createPostgreSQLProtocolAdapter();
             case "oracle":
                 // 未来可以支持Oracle
                 return createMySqlProtocolAdapter(); // 临时返回MySQL适配器
@@ -59,6 +59,18 @@ public class GatewayConfig {
     
     private ProtocolAdapter createMySqlProtocolAdapter() {
         MySqlProtocolAdapter adapter = new MySqlProtocolAdapter();
+        adapter.setPort(proxyPort);
+        // 设置目标数据库信息
+        adapter.setTargetHost(targetHost);
+        adapter.setTargetPort(targetPort);
+        adapter.setTargetUsername(targetUsername);
+        adapter.setTargetPassword(targetPassword);
+        adapter.setTargetDatabase(targetDatabase);
+        return adapter;
+    }
+    
+    private ProtocolAdapter createPostgreSQLProtocolAdapter() {
+        PostgreSQLProtocolAdapter adapter = new PostgreSQLProtocolAdapter();
         adapter.setPort(proxyPort);
         // 设置目标数据库信息
         adapter.setTargetHost(targetHost);

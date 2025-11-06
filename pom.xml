@@ -22,6 +22,7 @@
         <assertj.version>3.24.2</assertj.version>
         <mockito.version>5.3.1</mockito.version>
         <mysql.version>8.0.33</mysql.version>
+        <postgresql.version>42.6.2</postgresql.version>
     </properties>
 
     <dependencyManagement>
@@ -67,6 +68,13 @@
             <groupId>mysql</groupId>
             <artifactId>mysql-connector-java</artifactId>
             <version>${mysql.version}</version>
+        </dependency>
+
+        <!-- PostgreSQL Connector -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
         </dependency>
 
         <!-- Lombok -->

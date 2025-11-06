@@ -3,9 +3,10 @@ package com.whosly.gateway.adapter;
 import com.whosly.gateway.adapter.mysql.MySQLHandshake;
 import com.whosly.gateway.adapter.mysql.MySQLPacket;
 import com.whosly.gateway.adapter.mysql.MySQLResultSet;
+import com.whosly.gateway.parser.SqlParser;
+import com.whosly.gateway.parser.DruidSqlParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-// Removed @Component annotation to avoid bean definition conflict
 
 import java.io.*;
 import java.net.*;
@@ -17,150 +18,23 @@ import java.util.concurrent.Executors;
  * MySQL protocol adapter implementation.
  * This adapter handles MySQL client connections and proxies them to backend databases.
  */
-public class MySqlProtocolAdapter implements ProtocolAdapter {
+public class MySqlProtocolAdapter extends AbstractProtocolAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(MySqlProtocolAdapter.class);
-
     private static final String PROTOCOL_NAME = "MySQL";
     private static final int DEFAULT_PORT = 3307;
     
-    private volatile boolean running = false;
-    private ServerSocket serverSocket;
-    private ExecutorService executorService;
-    private com.whosly.gateway.parser.SqlParser sqlParser;
-    private com.whosly.gateway.service.DatabaseConnectionService databaseConnectionService;
-    private int port = DEFAULT_PORT;
-    
-    // 目标数据库配置
-    private String targetHost = "localhost";
-    private int targetPort = 3306;
-    private String targetUsername = "root";
-    private String targetPassword = "password";
-    private String targetDatabase = "testdb";
-    
     public MySqlProtocolAdapter() {
-        this.sqlParser = new com.whosly.gateway.parser.DruidSqlParser();
-        this.databaseConnectionService = new com.whosly.gateway.service.DatabaseConnectionService();
+        super(PROTOCOL_NAME, DEFAULT_PORT);
     }
     
-    public void setPort(int port) {
-        this.port = port;
-    }
-    
-    public int getPort() {
-        return this.port;
-    }
-    
-    // 目标数据库配置的setter方法
-    public void setTargetHost(String targetHost) {
-        this.targetHost = targetHost;
-    }
-    
-    public void setTargetPort(int targetPort) {
-        this.targetPort = targetPort;
-    }
-    
-    public void setTargetUsername(String targetUsername) {
-        this.targetUsername = targetUsername;
-    }
-    
-    public void setTargetPassword(String targetPassword) {
-        this.targetPassword = targetPassword;
-    }
-    
-    public void setTargetDatabase(String targetDatabase) {
-        this.targetDatabase = targetDatabase;
-    }
-
     @Override
-    public String getProtocolName() {
-        return PROTOCOL_NAME;
-    }
-
-    @Override
-    public int getDefaultPort() {
-        return port;
-    }
-
-    @Override
-    public void start() {
-        if (running) {
-            log.warn("MySQL protocol adapter is already running");
-            return;
-        }
-        
-        try {
-            serverSocket = new ServerSocket(port);
-            executorService = Executors.newCachedThreadPool();
-            running = true;
-            
-            log.info("Starting MySQL protocol adapter on port {}", port);
-            
-            // Start accepting client connections
-            executorService.submit(this::acceptConnections);
-            
-            log.info("MySQL protocol adapter started successfully");
-        } catch (IOException e) {
-            log.error("Failed to start MySQL protocol adapter", e);
-            running = false;
-        }
-    }
-
-    @Override
-    public void stop() {
-        if (!running) {
-            log.warn("MySQL protocol adapter is not running");
-            return;
-        }
-        
-        log.info("Stopping MySQL protocol adapter");
-        
-        try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
-            }
-            
-            if (executorService != null) {
-                executorService.shutdown();
-            }
-        } catch (IOException e) {
-            log.error("Error stopping MySQL protocol adapter", e);
-        }
-        
-        running = false;
-        log.info("MySQL protocol adapter stopped successfully");
-    }
-
-    @Override
-    public boolean isRunning() {
-        return running;
+    protected SqlParser createSqlParser() {
+        return new DruidSqlParser();
     }
     
-    /**
-     * Accept client connections and handle them in separate threads.
-     */
-    private void acceptConnections() {
-        while (running && !serverSocket.isClosed()) {
-            try {
-                Socket clientSocket = serverSocket.accept();
-                log.info("New client connection accepted from {}", clientSocket.getRemoteSocketAddress());
-                
-                // Handle each client in a separate thread
-                executorService.submit(() -> handleClientConnection(clientSocket));
-            } catch (IOException e) {
-                if (running) {
-                    log.error("Error accepting client connection", e);
-                }
-            }
-        }
-    }
-    
-    /**
-     * Handle a MySQL client connection with full protocol support.
-     * 
-     * @param clientSocket the client socket
-     */
-    private void handleClientConnection(Socket clientSocket) {
+    @Override
+    protected void handleClientConnection(Socket clientSocket) {
         Connection backendConnection = null;
         try {
             log.info("Handling new client connection from {}", clientSocket.getRemoteSocketAddress());
@@ -254,7 +128,7 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
             }
         }
     }
-    
+
     /**
      * Perform the initial MySQL protocol handshake.
      */
@@ -266,7 +140,7 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
         clientOut.write(handshakePacket);
         clientOut.flush();
     }
-    
+
     /**
      * Authenticate client and get database connection information.
      * 
@@ -280,7 +154,7 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
         // Parse authentication packet
         return MySQLHandshake.parseAuthPacket(packetData);
     }
-    
+
     /**
      * Proxy communication between client and backend database.
      */
@@ -397,6 +271,403 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     }
     
     /**
+     * 处理COM_QUERY命令
+     */
+    private void handleQueryCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 提取SQL查询（去掉命令字节）
+            String sqlQuery = new String(packetData, 1, packetData.length - 1);
+            log.info("Received SQL query: {}", sqlQuery);
+            
+            // 检查是否是特殊查询命令
+            String trimmedQuery = sqlQuery.trim();
+            if (trimmedQuery.equalsIgnoreCase("SELECT DATABASE()")) {
+                // 返回当前数据库名称
+                handleSelectDatabaseQuery(sequenceId, clientOut, backendConnection);
+            } else if (trimmedQuery.toUpperCase().startsWith("SHOW DATABASES")) {
+                // 返回数据库列表
+                handleShowDatabasesQuery(sequenceId, clientOut, backendConnection);
+            } else if (trimmedQuery.toUpperCase().startsWith("SHOW TABLES")) {
+                // 返回表列表
+                handleShowTablesQuery(sequenceId, clientOut, backendConnection);
+            } else if (trimmedQuery.toUpperCase().startsWith("SHOW VARIABLES")) {
+                // 处理SHOW VARIABLES查询
+                handleShowVariablesQuery(trimmedQuery, sequenceId, clientOut, backendConnection);
+            } else if (trimmedQuery.toUpperCase().startsWith("SHOW")) {
+                // 处理其他SHOW查询，直接转发到后端数据库
+                executeSqlQuery(sqlQuery, sequenceId, clientOut, backendConnection);
+            } else {
+                // 执行普通的SQL查询
+                executeSqlQuery(sqlQuery, sequenceId, clientOut, backendConnection);
+            }
+        } catch (Exception e) {
+            log.error("Error handling COM_QUERY command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理SELECT DATABASE()查询
+     */
+    private void handleSelectDatabaseQuery(int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            String currentDatabase = "demo"; // 默认数据库
+            try {
+                if (backendConnection != null && !backendConnection.isClosed()) {
+                    currentDatabase = backendConnection.getCatalog();
+                }
+            } catch (SQLException e) {
+                log.warn("Failed to get current database, using default: demo");
+            }
+            
+            // 发送结果集
+            sendSingleValueResultSet(currentDatabase, "DATABASE()", sequenceId, clientOut);
+        } catch (Exception e) {
+            log.error("Error handling SELECT DATABASE() query", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理SHOW DATABASES查询
+     */
+    private void handleShowDatabasesQuery(int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 从后端数据库获取真实的数据库列表
+            Statement stmt = backendConnection.createStatement();
+            ResultSet rs = stmt.executeQuery("SHOW DATABASES");
+            
+            // 发送结果集
+            sendResultSet(rs, sequenceId, clientOut);
+            
+            rs.close();
+            stmt.close();
+        } catch (Exception e) {
+            log.error("Error handling SHOW DATABASES query", e);
+            // 如果无法从后端获取数据库列表，则返回硬编码的列表
+            try {
+                String[] databases = {"information_schema", "demo", "mysql", "performance_schema", "sys"};
+                
+                // 发送列数包
+                byte[] columnCountPacket = MySQLPacket.createPacket(new byte[]{1}, sequenceId);
+                clientOut.write(columnCountPacket);
+                clientOut.flush();
+                
+                // 发送列定义
+                sendColumnDefinition("Database", sequenceId + 1, clientOut);
+                
+                // 发送列定义结束包
+                byte[] columnEofPacket = MySQLResultSet.createEofPacket(sequenceId + 2);
+                clientOut.write(columnEofPacket);
+                clientOut.flush();
+                
+                // 发送行数据
+                int rowSequenceId = sequenceId + 3;
+                for (String database : databases) {
+                    sendTextRowData(new String[]{database}, rowSequenceId++, clientOut);
+                }
+                
+                // 发送结果集结束包
+                byte[] resultEofPacket = MySQLResultSet.createEofPacket(rowSequenceId);
+                clientOut.write(resultEofPacket);
+                clientOut.flush();
+            } catch (Exception fallbackException) {
+                log.error("Error sending fallback database list", fallbackException);
+                byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + fallbackException.getMessage(), sequenceId + 1);
+                clientOut.write(errorPacket);
+                clientOut.flush();
+            }
+        }
+    }
+    
+    /**
+     * 处理SHOW TABLES查询
+     */
+    private void handleShowTablesQuery(int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 获取当前数据库名称
+            String currentDatabase = "demo"; // 默认数据库
+            try {
+                if (backendConnection != null && !backendConnection.isClosed()) {
+                    currentDatabase = backendConnection.getCatalog();
+                }
+            } catch (SQLException ex) {
+                log.warn("Failed to get current database, using default: demo");
+            }
+            
+            // 从后端数据库获取指定数据库的表列表
+            Statement stmt = backendConnection.createStatement();
+            String query = "SHOW TABLES FROM `" + currentDatabase + "`";
+            ResultSet rs = stmt.executeQuery(query);
+            
+            // 发送结果集
+            sendResultSet(rs, sequenceId, clientOut);
+            
+            rs.close();
+            stmt.close();
+        } catch (Exception e) {
+            log.error("Error handling SHOW TABLES query", e);
+            // 如果无法从后端获取表列表，则返回硬编码的列表
+            try {
+                // 获取当前数据库名称
+                String currentDatabase = "demo"; // 默认数据库
+                try {
+                    if (backendConnection != null && !backendConnection.isClosed()) {
+                        currentDatabase = backendConnection.getCatalog();
+                    }
+                } catch (SQLException ex) {
+                    log.warn("Failed to get current database, using default: demo");
+                }
+                
+                // 对于不同的系统数据库，返回不同的表列表
+                String[] tables;
+                if ("information_schema".equals(currentDatabase)) {
+                    tables = new String[]{"COLUMNS", "TABLES", "SCHEMATA", "ROUTINES", "PARAMETERS", "ENGINES", "VARIABLES"};
+                } else if ("mysql".equals(currentDatabase)) {
+                    tables = new String[]{"user", "db", "tables_priv", "columns_priv", "procs_priv"};
+                } else if ("performance_schema".equals(currentDatabase)) {
+                    tables = new String[]{"accounts", "hosts", "threads", "events_waits_current", "events_waits_history"};
+                } else if ("sys".equals(currentDatabase)) {
+                    tables = new String[]{"sys_config", "statements_with_runtimes_in_95th_percentile"};
+                } else {
+                    tables = new String[]{"a", "b", "c"}; // 默认示例表名
+                }
+                
+                // 发送列数包
+                byte[] columnCountPacket = MySQLPacket.createPacket(new byte[]{1}, sequenceId);
+                clientOut.write(columnCountPacket);
+                clientOut.flush();
+                
+                // 发送列定义 (使用正确的列名格式)
+                sendColumnDefinition("Tables_in_" + currentDatabase, sequenceId + 1, clientOut);
+                
+                // 发送列定义结束包
+                byte[] columnEofPacket = MySQLResultSet.createEofPacket(sequenceId + 2);
+                clientOut.write(columnEofPacket);
+                clientOut.flush();
+                
+                // 发送行数据
+                int rowSequenceId = sequenceId + 3;
+                for (String table : tables) {
+                    sendTextRowData(new String[]{table}, rowSequenceId++, clientOut);
+                }
+                
+                // 发送结果集结束包
+                byte[] resultEofPacket = MySQLResultSet.createEofPacket(rowSequenceId);
+                clientOut.write(resultEofPacket);
+                clientOut.flush();
+            } catch (Exception fallbackException) {
+                log.error("Error sending fallback table list", fallbackException);
+                byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + fallbackException.getMessage(), sequenceId + 1);
+                clientOut.write(errorPacket);
+                clientOut.flush();
+            }
+        }
+    }
+    
+    /**
+     * 执行普通的SQL查询
+     */
+    private void executeSqlQuery(String sqlQuery, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 处理多语句查询
+            String[] statements = sqlQuery.split(";");
+            int currentSequenceId = sequenceId;
+            
+            for (int i = 0; i < statements.length; i++) {
+                String statement = statements[i].trim();
+                if (statement.isEmpty()) {
+                    continue;
+                }
+                
+                Statement stmt = backendConnection.createStatement();
+                boolean hasResultSet = stmt.execute(statement);
+                
+                if (hasResultSet) {
+                    ResultSet rs = stmt.getResultSet();
+                    sendResultSet(rs, currentSequenceId, clientOut);
+                    rs.close();
+                    currentSequenceId += 10; // 为下一个结果集留出空间
+                } else {
+                    // 对于更新语句，发送OK包
+                    int updateCount = stmt.getUpdateCount();
+                    byte[] okPacket = MySQLHandshake.createOkPacket(currentSequenceId + 1);
+                    clientOut.write(okPacket);
+                    clientOut.flush();
+                    currentSequenceId += 2; // 为下一个OK包留出空间
+                }
+                
+                stmt.close();
+            }
+        } catch (SQLException e) {
+            log.error("Error executing SQL query: {}", sqlQuery, e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "SQL Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 发送单值结果集
+     */
+    private void sendSingleValueResultSet(String value, String columnName, int sequenceId, OutputStream clientOut) throws IOException {
+        try {
+            // 发送列数包
+            byte[] columnCountPacket = MySQLPacket.createPacket(new byte[]{1}, sequenceId);
+            clientOut.write(columnCountPacket);
+            clientOut.flush();
+            
+            // 发送列定义包
+            sendColumnDefinition(columnName, sequenceId + 1, clientOut);
+            
+            // 发送行数据
+            sendTextRowData(new String[]{value}, sequenceId + 2, clientOut);
+            
+            // 发送EOF包
+            byte[] eofPacket = MySQLResultSet.createEofPacket(sequenceId + 3);
+            clientOut.write(eofPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error sending single value result set", e);
+            throw new IOException("Failed to send result set", e);
+        }
+    }
+    
+    /**
+     * 发送列定义
+     */
+    private void sendColumnDefinition(String columnName, int sequenceId, OutputStream clientOut) throws IOException {
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            
+            // 目录名称
+            baos.write(MySQLPacket.writeLengthEncodedString("def"));
+            
+            // 模式名称（数据库名）
+            baos.write(MySQLPacket.writeLengthEncodedString(""));
+            
+            // 表名称
+            baos.write(MySQLPacket.writeLengthEncodedString(""));
+            
+            // 原始表名称
+            baos.write(MySQLPacket.writeLengthEncodedString(""));
+            
+            // 列名称
+            baos.write(MySQLPacket.writeLengthEncodedString(columnName));
+            
+            // 原始列名称
+            baos.write(MySQLPacket.writeLengthEncodedString(columnName));
+            
+            // 填充字段
+            baos.write(MySQLPacket.writeLengthEncodedInteger(0x0C));
+            
+            // 字符集
+            baos.write(0x21); // utf8_general_ci
+            baos.write(0x00);
+            
+            // 列长度
+            baos.write(0xFF);
+            baos.write(0xFF);
+            baos.write(0xFF);
+            baos.write(0xFF);
+            
+            // 列类型
+            baos.write(0x0F); // MYSQL_TYPE_STRING
+            
+            // 标志
+            baos.write(0x00);
+            baos.write(0x00);
+            
+            // 小数位数
+            baos.write(0x00);
+            
+            // 填充字段
+            baos.write(0x00);
+            baos.write(0x00);
+            
+            byte[] columnDefPacket = MySQLPacket.createPacket(baos.toByteArray(), sequenceId);
+            clientOut.write(columnDefPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error sending column definition", e);
+            throw new IOException("Failed to send column definition", e);
+        }
+    }
+    
+    /**
+     * 发送文本行数据
+     */
+    private void sendTextRowData(String[] values, int sequenceId, OutputStream clientOut) throws IOException {
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            
+            // 为每个值写入长度编码的字符串
+            for (String value : values) {
+                if (value == null) {
+                    baos.write(0xFB); // NULL值
+                } else {
+                    baos.write(MySQLPacket.writeLengthEncodedString(value));
+                }
+            }
+            
+            byte[] rowDataPacket = MySQLPacket.createPacket(baos.toByteArray(), sequenceId);
+            clientOut.write(rowDataPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error sending row data", e);
+            throw new IOException("Failed to send row data", e);
+        }
+    }
+    
+    /**
+     * 发送结果集
+     */
+    private void sendResultSet(ResultSet rs, int sequenceId, OutputStream clientOut) throws IOException {
+        try {
+            ResultSetMetaData metaData = rs.getMetaData();
+            int columnCount = metaData.getColumnCount();
+            
+            // 发送列数包
+            byte[] columnCountPayload = MySQLPacket.writeLengthEncodedInteger(columnCount);
+            byte[] columnCountPacket = MySQLPacket.createPacket(columnCountPayload, sequenceId);
+            clientOut.write(columnCountPacket);
+            clientOut.flush();
+            
+            // 发送列定义包
+            for (int i = 1; i <= columnCount; i++) {
+                byte[] columnDefPacket = MySQLResultSet.createColumnDefinitionPacket(metaData, i, sequenceId + i);
+                clientOut.write(columnDefPacket);
+                clientOut.flush();
+            }
+            
+            // 发送列定义结束包
+            byte[] columnEofPacket = MySQLResultSet.createEofPacket(sequenceId + columnCount + 1);
+            clientOut.write(columnEofPacket);
+            clientOut.flush();
+            
+            // 发送行数据
+            int rowSequenceId = sequenceId + columnCount + 2;
+            while (rs.next()) {
+                byte[] rowDataPacket = MySQLResultSet.createRowDataPacket(rs, metaData, columnCount, rowSequenceId++);
+                clientOut.write(rowDataPacket);
+                clientOut.flush();
+            }
+            
+            // 发送结果集结束包
+            byte[] resultEofPacket = MySQLResultSet.createEofPacket(rowSequenceId);
+            clientOut.write(resultEofPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error sending result set", e);
+            throw new IOException("Failed to send result set", e);
+        }
+    }
+    
+    /**
      * 处理COM_INIT_DB命令
      */
     private void handleInitDbCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
@@ -405,8 +676,12 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
             String databaseName = new String(packetData, 1, packetData.length - 1);
             log.info("Changing to database: {}", databaseName);
             
-            // 在实际实现中，这里应该切换到指定的数据库
-            // 为简化起见，我们直接返回OK包
+            // 实际切换到指定的数据库
+            if (backendConnection != null && !backendConnection.isClosed()) {
+                backendConnection.setCatalog(databaseName);
+            }
+            
+            // 返回OK包
             byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
             clientOut.write(okPacket);
             clientOut.flush();
@@ -492,6 +767,24 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
             clientOut.flush();
         } catch (Exception e) {
             log.error("Error handling COM_REFRESH command", e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理COM_STATISTICS命令
+     */
+    private void handleStatisticsCommand(int sequenceId, OutputStream clientOut) throws IOException {
+        try {
+            // 在实际实现中，这里应该返回服务器统计信息
+            // 为简化起见，我们直接返回OK包
+            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
+            clientOut.write(okPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling COM_STATISTICS command", e);
             byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
             clientOut.write(errorPacket);
             clientOut.flush();
@@ -607,86 +900,83 @@ public class MySqlProtocolAdapter implements ProtocolAdapter {
     }
     
     /**
-     * 处理COM_QUERY命令
+     * 处理SHOW VARIABLES查询
      */
-    private void handleQueryCommand(byte[] packetData, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
+    private void handleShowVariablesQuery(String query, int sequenceId, OutputStream clientOut, Connection backendConnection) throws IOException {
         try {
-            // 提取SQL查询语句（去掉命令字节）
-            String sqlQuery = new String(packetData, 1, packetData.length - 1);
-            log.info("Received SQL query: {}", sqlQuery);
-            
-            // 执行SQL查询
-            Statement stmt = backendConnection.createStatement();
-            boolean hasResultSet = stmt.execute(sqlQuery);
-            
-            if (hasResultSet) {
-                ResultSet rs = stmt.getResultSet();
-                ResultSetMetaData metaData = rs.getMetaData();
-                int columnCount = metaData.getColumnCount();
-                
-                // Send column count packet
-                byte[] columnCountPacket = MySQLResultSet.createColumnCountPacket(metaData, columnCount, sequenceId + 1);
-                clientOut.write(columnCountPacket);
-                clientOut.flush();
-                
-                // Send column definition packets
-                for (int i = 1; i <= columnCount; i++) {
-                    byte[] columnDefPacket = MySQLResultSet.createColumnDefinitionPacket(metaData, i, sequenceId + 1 + i);
-                    clientOut.write(columnDefPacket);
-                    clientOut.flush();
+            // 解析变量名
+            String variableName = "";
+            if (query.toUpperCase().contains("LIKE")) {
+                int likeIndex = query.toUpperCase().indexOf("LIKE");
+                String likeClause = query.substring(likeIndex + 5).trim();
+                // 移除引号
+                if (likeClause.startsWith("'") && likeClause.endsWith("'")) {
+                    variableName = likeClause.substring(1, likeClause.length() - 1);
+                } else if (likeClause.startsWith("\"") && likeClause.endsWith("\"")) {
+                    variableName = likeClause.substring(1, likeClause.length() - 1);
                 }
-                
-                // Send EOF packet after column definitions
-                byte[] eofPacket1 = MySQLResultSet.createEofPacket(sequenceId + 1 + columnCount + 1);
-                clientOut.write(eofPacket1);
-                clientOut.flush();
-                
-                // Send row data packets
-                int rowSequenceId = sequenceId + 1 + columnCount + 2;
-                while (rs.next()) {
-                    byte[] rowDataPacket = MySQLResultSet.createRowDataPacket(rs, metaData, columnCount, rowSequenceId++);
-                    clientOut.write(rowDataPacket);
-                    clientOut.flush();
-                }
-                
-                // Send final EOF packet
-                byte[] eofPacket2 = MySQLResultSet.createEofPacket(rowSequenceId);
-                clientOut.write(eofPacket2);
-                clientOut.flush();
-                
-                rs.close();
-            } else {
-                int updateCount = stmt.getUpdateCount();
-                // Send OK packet for update statements
-                byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
-                clientOut.write(okPacket);
-                clientOut.flush();
             }
             
-            stmt.close();
-        } catch (SQLException e) {
-            // Send error packet
-            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "SQL Error: " + e.getMessage(), sequenceId + 1);
+            // 根据变量名返回相应的值
+            if (variableName.equalsIgnoreCase("lower_case_%")) {
+                // 返回lower_case相关的变量
+                sendVariablesResultSet(new String[][] {
+                    {"lower_case_file_system", "OFF"},
+                    {"lower_case_table_names", "0"}
+                }, sequenceId, clientOut);
+            } else if (variableName.equalsIgnoreCase("sql_mode")) {
+                // 返回sql_mode变量
+                sendVariablesResultSet(new String[][] {
+                    {"sql_mode", "STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"}
+                }, sequenceId, clientOut);
+            } else {
+                // 返回空结果集或默认值
+                sendVariablesResultSet(new String[][] {
+                    {"Variable_name", "Value"}
+                }, sequenceId, clientOut);
+            }
+        } catch (Exception e) {
+            log.error("Error handling SHOW VARIABLES query: {}", query, e);
+            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
             clientOut.write(errorPacket);
             clientOut.flush();
         }
     }
     
     /**
-     * 处理COM_STATISTICS命令
+     * 发送变量结果集
      */
-    private void handleStatisticsCommand(int sequenceId, OutputStream clientOut) throws IOException {
+    private void sendVariablesResultSet(String[][] variables, int sequenceId, OutputStream clientOut) throws IOException {
         try {
-            // 在实际实现中，这里应该返回服务器统计信息
-            // 为简化起见，我们直接返回OK包
-            byte[] okPacket = MySQLHandshake.createOkPacket(sequenceId + 1);
-            clientOut.write(okPacket);
+            // 发送列数包（2列：Variable_name, Value）
+            byte[] columnCountPacket = MySQLPacket.createPacket(new byte[]{2}, sequenceId);
+            clientOut.write(columnCountPacket);
+            clientOut.flush();
+            
+            // 发送列定义包
+            sendColumnDefinition("Variable_name", sequenceId + 1, clientOut);
+            sendColumnDefinition("Value", sequenceId + 2, clientOut);
+            
+            // 发送列定义结束包
+            byte[] columnEofPacket = MySQLResultSet.createEofPacket(sequenceId + 3);
+            clientOut.write(columnEofPacket);
+            clientOut.flush();
+            
+            // 发送行数据
+            int rowSequenceId = sequenceId + 4;
+            for (int i = 0; i < variables.length; i++) {
+                if (variables[i].length >= 2) {
+                    sendTextRowData(variables[i], rowSequenceId++, clientOut);
+                }
+            }
+            
+            // 发送结果集结束包
+            byte[] resultEofPacket = MySQLResultSet.createEofPacket(rowSequenceId);
+            clientOut.write(resultEofPacket);
             clientOut.flush();
         } catch (Exception e) {
-            log.error("Error handling COM_STATISTICS command", e);
-            byte[] errorPacket = MySQLHandshake.createErrorPacket(1001, "HY000", "Error: " + e.getMessage(), sequenceId + 1);
-            clientOut.write(errorPacket);
-            clientOut.flush();
+            log.error("Error sending variables result set", e);
+            throw new IOException("Failed to send variables result set", e);
         }
     }
 }

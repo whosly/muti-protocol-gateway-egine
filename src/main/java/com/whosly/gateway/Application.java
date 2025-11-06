@@ -25,9 +25,6 @@ public class Application {
     @Autowired
     private ProtocolAdapter protocolAdapter;
     
-    @Value("${gateway.proxy-db-type:mysql}")
-    private String proxyDbType;
-    
     // 注入GatewayConfig以获取目标数据库配置信息
     @Autowired
     private GatewayConfig gatewayConfig;
@@ -39,7 +36,8 @@ public class Application {
     @EventListener
     public void onApplicationEvent(ContextRefreshedEvent event) {
         // Start the protocol adapter when the application context is refreshed
-        log.info("Starting {} protocol adapter...", proxyDbType.toUpperCase());
+        String protocolType = gatewayConfig.getProxyDbType().toUpperCase();
+        log.info("Starting {} protocol adapter...", protocolType);
         protocolAdapter.start();
         
         // 输出代理地址信息和目标数据库信息
@@ -50,8 +48,11 @@ public class Application {
      * 输出代理地址信息和目标数据库信息
      */
     private void logInfo() {
+        // 获取协议类型
+        String protocolType = gatewayConfig.getProxyDbType().toUpperCase();
+        
         // 输出代理信息
-        log.info("{} Protocol Proxy Info:", proxyDbType.toUpperCase());
+        log.info("{} Protocol Proxy Info:", protocolType);
         log.info("  Proxy Address: localhost:{}", protocolAdapter.getDefaultPort());
         
         // 输出目标数据库信息
