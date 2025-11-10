@@ -59,45 +59,80 @@
 - 面向接口编程：各组件通过接口交互，降低耦合度
 - 可测试性：模块化设计，便于单元测试和集成测试
 
-## 5. 质量目标
 
-### 5.1 性能指标
-- 单节点支持至少1000个并发连接
-- SQL命令转发延迟小于10毫秒（局域网环境下）
-- 内存占用控制在512MB以内（默认配置）
+## 配置
 
-### 5.2 可靠性指标
-- 平均无故障时间(MTBF)大于1000小时
-- 故障恢复时间小于30秒
-- 提供完善的错误处理和异常恢复机制
+在 `src/main/resources/application.yml` 中配置PostgreSQL网关：
 
-### 5.3 安全性指标
-- 支持TLS/SSL加密通信
-- 提供SQL注入防护
-- 实现细粒度的访问控制
+```yaml
+gateway:
+  # 数据库类型配置
+  proxy-db-type: postgresql
+  # 代理端口
+  proxy-port: 5433
 
-## 6. 交付目标
+  # 目标数据库配置
+  target:
+    host: localhost
+    port: 5432
+    username: postgres
+    password: Aa123456.
+    database: dmp
+```
 
-### 6.1 文档交付
-- 完整的用户手册和开发者指南
-- API文档和配置说明
-- 部署和运维指南
+## 启动网关
 
-### 6.2 代码质量
-- 单元测试覆盖率不低于80%
-- 遵循Java编码规范和最佳实践
-- 提供完整的构建和部署脚本
+```bash
+# 编译项目
+mvn clean package
 
-### 6.3 兼容性保证
-- 支持主流操作系统（Windows、Linux、macOS）
-- 兼容主流数据库版本
-- 提供向前兼容性保证
+# 启动网关
+java -jar target/muti-protocol-gateway-egine-1.0.0-SNAPSHOT.jar
+```
 
-## 7. 成功标准
+或者使用Spring Boot Maven插件：
 
-项目成功的衡量标准包括：
-1. 实现原始需求："启动应用时，可以根据输入的数据库认证信息，代理连接至该数据库"
-2. 通过所有单元测试和集成测试
-3. 达到性能基准要求
-4. 用户验收测试通过
-5. 文档完整性和准确性得到确认
+```bash
+mvn spring-boot:run
+```
+
+## 测试连接
+
+### 使用psql客户端
+
+```bash
+# 连接到网关（端口5433）
+psql -h localhost -p 5433 -U postgres -d dmp
+
+# 输入密码后，可以执行SQL查询
+```
+
+### 测试SQL查询
+
+```sql
+-- 查看所有表
+\dt
+
+-- 创建测试表
+CREATE TABLE test_table (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    age INTEGER
+);
+
+-- 插入数据
+INSERT INTO test_table (name, age) VALUES ('Alice', 25);
+INSERT INTO test_table (name, age) VALUES ('Bob', 30);
+
+-- 查询数据
+SELECT * FROM test_table;
+
+-- 更新数据
+UPDATE test_table SET age = 26 WHERE name = 'Alice';
+
+-- 删除数据
+DELETE FROM test_table WHERE name = 'Bob';
+
+-- 删除表
+DROP TABLE test_table;
+```

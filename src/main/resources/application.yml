@@ -7,7 +7,8 @@ spring:
 
 logging:
   level:
-    com.whosly.gateway: INFO
+    com.whosly.gateway: DEBUG
+    com.whosly.gateway.adapter: DEBUG
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
 

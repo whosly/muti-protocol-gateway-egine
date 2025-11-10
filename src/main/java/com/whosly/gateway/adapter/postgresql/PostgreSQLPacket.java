@@ -110,13 +110,14 @@ public class PostgreSQLPacket {
         // 消息类型：'R' (Authentication)
         baos.write('R');
         
-        // 消息长度（8字节：类型(1) + 长度(4) + 认证结果(4)）
+        // 消息长度（长度字段本身4字节 + 认证类型4字节 = 8字节）
+        // 注意：长度不包括消息类型字节
         baos.write(0);
         baos.write(0);
         baos.write(0);
         baos.write(8);
         
-        // 认证结果：0表示认证成功
+        // 认证类型：0表示认证成功（AuthenticationOk）
         baos.write(0);
         baos.write(0);
         baos.write(0);
@@ -164,11 +165,12 @@ public class PostgreSQLPacket {
         // 消息类型：'S' (ParameterStatus)
         baos.write('S');
         
-        byte[] nameBytes = name.getBytes();
-        byte[] valueBytes = value.getBytes();
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
         
-        // 消息长度（类型(1) + 长度(4) + 名称长度 + null终止符(1) + 值长度 + null终止符(1)）
-        int messageLength = 4 + 1 + nameBytes.length + 1 + valueBytes.length + 1;
+        // 消息长度（长度字段本身4字节 + 名称长度 + null终止符1字节 + 值长度 + null终止符1字节）
+        // 注意：长度不包括消息类型字节
+        int messageLength = 4 + nameBytes.length + 1 + valueBytes.length + 1;
         baos.write((messageLength >> 24) & 0xFF);
         baos.write((messageLength >> 16) & 0xFF);
         baos.write((messageLength >> 8) & 0xFF);
@@ -198,19 +200,20 @@ public class PostgreSQLPacket {
         // 消息类型：'K' (BackendKeyData)
         baos.write('K');
         
-        // 消息长度（12字节：类型(1) + 长度(4) + 进程ID(4) + 秘密密钥(4)）
+        // 消息长度（长度字段本身4字节 + 进程ID 4字节 + 秘密密钥4字节 = 12字节）
+        // 注意：长度不包括消息类型字节
         baos.write(0);
         baos.write(0);
         baos.write(0);
         baos.write(12);
         
-        // 进程ID
+        // 进程ID（大端序）
         baos.write((processId >> 24) & 0xFF);
         baos.write((processId >> 16) & 0xFF);
         baos.write((processId >> 8) & 0xFF);
         baos.write(processId & 0xFF);
         
-        // 秘密密钥
+        // 秘密密钥（大端序）
         baos.write((secretKey >> 24) & 0xFF);
         baos.write((secretKey >> 16) & 0xFF);
         baos.write((secretKey >> 8) & 0xFF);
@@ -231,13 +234,14 @@ public class PostgreSQLPacket {
         // 消息类型：'Z' (ReadyForQuery)
         baos.write('Z');
         
-        // 消息长度（5字节：类型(1) + 长度(4) + 事务状态(1)）
+        // 消息长度（长度字段本身4字节 + 事务状态1字节 = 5字节）
+        // 注意：长度不包括消息类型字节
         baos.write(0);
         baos.write(0);
         baos.write(0);
         baos.write(5);
         
-        // 事务状态
+        // 事务状态 ('I' = idle, 'T' = in transaction, 'E' = failed transaction)
         baos.write(transactionStatus);
         
         return baos.toByteArray();
@@ -257,31 +261,35 @@ public class PostgreSQLPacket {
         // 消息类型：'E' (ErrorResponse)
         baos.write('E');
         
-        byte[] severityBytes = ("S" + severity).getBytes();
-        byte[] codeBytes = ("C" + code).getBytes();
-        byte[] messageBytes = ("M" + message).getBytes();
+        // 构建字段内容（每个字段格式：字段类型(1字节) + 字符串 + null终止符）
+        byte[] severityBytes = severity.getBytes(StandardCharsets.UTF_8);
+        byte[] codeBytes = code.getBytes(StandardCharsets.UTF_8);
+        byte[] messageBytes = message.getBytes(StandardCharsets.UTF_8);
         
-        // 消息长度（类型(1) + 长度(4) + 严重性字段 + 代码字段 + 消息字段 + null终止符(1)）
-        int messageLength = 4 + 1 + severityBytes.length + 1 + codeBytes.length + 1 + messageBytes.length + 1 + 1;
+        // 消息长度 = 长度字段本身(4) + 'S'(1) + severity + null(1) + 'C'(1) + code + null(1) + 'M'(1) + message + null(1) + 结束null(1)
+        int messageLength = 4 + 1 + severityBytes.length + 1 + 1 + codeBytes.length + 1 + 1 + messageBytes.length + 1 + 1;
         baos.write((messageLength >> 24) & 0xFF);
         baos.write((messageLength >> 16) & 0xFF);
         baos.write((messageLength >> 8) & 0xFF);
         baos.write(messageLength & 0xFF);
         
-        // 严重性字段
+        // 严重性字段 (S)
+        baos.write('S');
         baos.write(severityBytes, 0, severityBytes.length);
         baos.write(0); // null终止符
         
-        // 错误代码字段
+        // 错误代码字段 (C)
+        baos.write('C');
         baos.write(codeBytes, 0, codeBytes.length);
         baos.write(0); // null终止符
         
-        // 错误消息字段
+        // 错误消息字段 (M)
+        baos.write('M');
         baos.write(messageBytes, 0, messageBytes.length);
         baos.write(0); // null终止符
         
-        // 消息结束
-        baos.write(0); // null终止符
+        // 消息结束标记
+        baos.write(0);
         
         return baos.toByteArray();
     }

@@ -35,10 +35,12 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
     protected void handleClientConnection(Socket clientSocket) {
         Connection backendConnection = null;
         try {
-            log.info("Handling new PostgreSQL client connection from {}", clientSocket.getRemoteSocketAddress());
+            log.info("=== New PostgreSQL client connection from {} ===", clientSocket.getRemoteSocketAddress());
             
             InputStream clientIn = clientSocket.getInputStream();
             OutputStream clientOut = clientSocket.getOutputStream();
+            
+            log.debug("Client socket input/output streams obtained");
             
             // 连接到后端数据库
             String dbUrl = String.format("jdbc:postgresql://%s:%d/%s", 
@@ -63,39 +65,48 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             
             // 检查是否是SSL请求
             if (authInfo.isSslRequest()) {
-                log.debug("SSL request received, switching to SSL mode");
+                log.info("SSL request received from client, sending rejection ('N')");
                 // 发送拒绝SSL的响应
                 clientOut.write('N');
                 clientOut.flush();
+                log.debug("SSL rejection sent, waiting for actual startup message");
                 
                 // 重新读取启动消息
                 authInfo = readStartupMessage(clientIn, clientOut);
-                if (authInfo == null || authInfo.isSslRequest()) {
-                    log.warn("Failed to read startup message after SSL rejection");
+                if (authInfo == null) {
+                    log.error("Failed to read startup message after SSL rejection");
                     return;
                 }
+                if (authInfo.isSslRequest()) {
+                    log.error("Received another SSL request after rejection");
+                    return;
+                }
+                log.info("Received actual startup message after SSL rejection");
             }
             
             // 直接发送认证成功消息，跳过密码验证
-            log.debug("Sending AuthenticationOk packet to client");
+            log.info("Sending authentication sequence to client (user: {}, database: {})", 
+                authInfo.getUsername(), authInfo.getDatabase());
+            
+            log.debug("Step 1: Sending AuthenticationOk packet");
             byte[] authOkPacket = PostgreSQLPacket.createAuthenticationOkPacket();
             clientOut.write(authOkPacket);
             clientOut.flush();
             
-            // Send parameter status packets
-            sendParameterStatusPackets(clientOut);
+            log.debug("Step 2: Sending parameter status packets");
+            sendParameterStatusPackets(clientOut, backendConnection);
             
-            // Send backend key data packet
+            log.debug("Step 3: Sending backend key data packet");
             byte[] backendKeyDataPacket = PostgreSQLPacket.createBackendKeyDataPacket(12345, 67890);
             clientOut.write(backendKeyDataPacket);
             clientOut.flush();
             
-            // Send ReadyForQuery packet
+            log.debug("Step 4: Sending ReadyForQuery packet");
             byte[] readyForQueryPacket = PostgreSQLPacket.createReadyForQueryPacket('I');
             clientOut.write(readyForQueryPacket);
             clientOut.flush();
             
-            log.debug("Authentication packets sent to client");
+            log.info("Authentication sequence completed successfully");
             
             // Proxy communication between client and backend
             log.info("Starting proxy communication");
@@ -163,24 +174,45 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             bytesRead = clientIn.read(sslBytes);
             log.debug("Checking for SSL request: {} bytes read", bytesRead);
             if (bytesRead == 4 && 
-                sslBytes[0] == 0x04 && sslBytes[1] == 0xd2 && 
+                sslBytes[0] == 0x04 && sslBytes[1] == (byte)0xd2 && 
                 sslBytes[2] == 0x16 && sslBytes[3] == 0x2f) {
+                log.info("SSL request detected (magic number: 0x04d2162f)");
                 PostgreSQLHandshake.AuthInfo authInfo = new PostgreSQLHandshake.AuthInfo();
                 authInfo.setSslRequest(true);
                 return authInfo;
+            } else {
+                log.debug("Not an SSL request, SSL bytes: 0x{}{}{}{}", 
+                    String.format("%02x", sslBytes[0]),
+                    String.format("%02x", sslBytes[1]),
+                    String.format("%02x", sslBytes[2]),
+                    String.format("%02x", sslBytes[3]));
             }
             // If it's not SSL request, continue with normal processing
         }
         
         // Read the rest of the message
-        byte[] messageBytes = new byte[messageLength - 4];
-        bytesRead = clientIn.read(messageBytes);
-        if (bytesRead < messageLength - 4) {
-            return null;
+        int remainingLength = messageLength - 4;
+        log.debug("Reading remaining {} bytes of startup message", remainingLength);
+        
+        byte[] messageBytes = new byte[remainingLength];
+        int totalRead = 0;
+        while (totalRead < remainingLength) {
+            int read = clientIn.read(messageBytes, totalRead, remainingLength - totalRead);
+            if (read == -1) {
+                log.warn("Unexpected end of stream while reading startup message");
+                return null;
+            }
+            totalRead += read;
         }
         
+        log.debug("Successfully read {} bytes of startup message", totalRead);
+        
         // Parse startup message
-        return PostgreSQLHandshake.parseStartupMessage(messageBytes);
+        PostgreSQLHandshake.AuthInfo authInfo = PostgreSQLHandshake.parseStartupMessage(messageBytes);
+        log.info("Parsed startup message: username={}, database={}", 
+            authInfo.getUsername(), authInfo.getDatabase());
+        
+        return authInfo;
     }
     
     /**
@@ -198,9 +230,22 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
     /**
      * Send parameter status packets to client
      */
-    private void sendParameterStatusPackets(OutputStream clientOut) throws IOException {
-        // Send server version
-        byte[] versionPacket = PostgreSQLPacket.createParameterStatusPacket("server_version", "13.0");
+    private void sendParameterStatusPackets(OutputStream clientOut, Connection backendConnection) throws IOException {
+        // Send server version - 从后端数据库获取真实版本
+        String serverVersion = "13.0"; // 默认值
+        try {
+            if (backendConnection != null && !backendConnection.isClosed()) {
+                DatabaseMetaData metaData = backendConnection.getMetaData();
+                int majorVersion = metaData.getDatabaseMajorVersion();
+                int minorVersion = metaData.getDatabaseMinorVersion();
+                serverVersion = majorVersion + "." + minorVersion;
+                log.debug("Backend PostgreSQL version: {}", serverVersion);
+            }
+        } catch (SQLException e) {
+            log.warn("Failed to get backend database version, using default: {}", serverVersion);
+        }
+        
+        byte[] versionPacket = PostgreSQLPacket.createParameterStatusPacket("server_version", serverVersion);
         clientOut.write(versionPacket);
         clientOut.flush();
         
@@ -362,6 +407,25 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             String sqlQuery = new String(messageBytes, 0, queryLength, "UTF-8").trim();
             log.info("Received SQL query: {}", sqlQuery);
             
+            // 处理特殊的客户端命令
+            String upperQuery = sqlQuery.toUpperCase();
+            
+            // Navicat等客户端会发送 set client_encoding to 'UNICODE'
+            // 需要转换为 UTF8，因为PostgreSQL JDBC驱动要求UTF8
+            if (upperQuery.contains("SET CLIENT_ENCODING") && upperQuery.contains("UNICODE")) {
+                log.debug("Converting UNICODE to UTF8 for client_encoding");
+                sqlQuery = "SET client_encoding TO 'UTF8'";
+            }
+            
+            // Navicat查询旧版本PostgreSQL的列datlastsysoid（已废弃）
+            // 在PostgreSQL 9.0+中，datlastsysoid已被移除，改写查询以兼容
+            if (upperQuery.contains("DATLASTSYSOID")) {
+                log.debug("Rewriting deprecated datlastsysoid query for compatibility");
+                // 在新版本中，可以用一个固定值代替（通常是10000）
+                // 或者查询 oid 列作为替代
+                sqlQuery = "SELECT DISTINCT 10000::oid as datlastsysoid FROM pg_database";
+            }
+            
             // 执行SQL查询
             Statement stmt = backendConnection.createStatement();
             boolean hasResultSet = stmt.execute(sqlQuery);
@@ -376,8 +440,7 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                 int updateCount = stmt.getUpdateCount();
                 String commandTag;
                 
-                // 根据SQL类型确定命令标签
-                String upperQuery = sqlQuery.toUpperCase().trim();
+                // 根据SQL类型确定命令标签（复用之前的upperQuery变量）
                 if (upperQuery.startsWith("INSERT")) {
                     commandTag = "INSERT 0 " + updateCount;
                 } else if (upperQuery.startsWith("UPDATE")) {
@@ -390,6 +453,8 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                     commandTag = "DROP TABLE";
                 } else if (upperQuery.startsWith("ALTER")) {
                     commandTag = "ALTER TABLE";
+                } else if (upperQuery.startsWith("SET")) {
+                    commandTag = "SET";
                 } else {
                     commandTag = "SELECT " + updateCount;
                 }
