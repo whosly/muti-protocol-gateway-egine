@@ -18,7 +18,11 @@ The Multi-Protocol Database Gateway Engine provides unified access to various da
 ## Documentation
 
 - [README.md](README.md) - This file, containing quick start information
-- [COMPREHENSIVE_DOCUMENTATION.md](COMPREHENSIVE_DOCUMENTATION.md) - Complete project documentation
+- [docs/COMPREHENSIVE_DOCUMENTATION.md](docs/COMPREHENSIVE_DOCUMENTATION.md) - Complete project documentation
+- [docs/PROJECT_OBJECTIVES.md](docs/PROJECT_OBJECTIVES.md) - Project goals and objectives
+- [docs/HIGH_LEVEL_DESIGN.md](docs/HIGH_LEVEL_DESIGN.md) - High-level architecture design
+- [docs/DETAILED_DESIGN.md](docs/DETAILED_DESIGN.md) - Detailed technical design
+- [docs/ENVIRONMENT_DOCUMENTATION.md](docs/ENVIRONMENT_DOCUMENTATION.md) - Environment setup guide
 
 ## Quick Start
 

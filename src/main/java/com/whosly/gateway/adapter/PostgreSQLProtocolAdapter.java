@@ -42,21 +42,7 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             
             log.debug("Client socket input/output streams obtained");
             
-            // 连接到后端数据库
-            String dbUrl = String.format("jdbc:postgresql://%s:%d/%s", 
-                targetHost,
-                targetPort,
-                targetDatabase);
-            
-            log.info("Connecting to backend database: {} with user: {}", dbUrl, targetUsername);
-            backendConnection = databaseConnectionService.connectToDatabase(
-                dbUrl, 
-                targetUsername, 
-                targetPassword
-            );
-            log.info("Successfully connected to backend database: {}", dbUrl);
-            
-            // 读取客户端启动消息
+            // 先读取客户端启动消息，获取客户端请求的数据库名
             PostgreSQLHandshake.AuthInfo authInfo = readStartupMessage(clientIn, clientOut);
             if (authInfo == null) {
                 log.warn("Failed to read startup message from client");
@@ -84,9 +70,29 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                 log.info("Received actual startup message after SSL rejection");
             }
             
+            // 使用客户端请求的数据库名，如果没有则使用配置的默认数据库
+            String requestedDatabase = authInfo.getDatabase();
+            if (requestedDatabase == null || requestedDatabase.isEmpty()) {
+                requestedDatabase = targetDatabase;
+            }
+            
+            // 连接到后端数据库
+            String dbUrl = String.format("jdbc:postgresql://%s:%d/%s", 
+                targetHost,
+                targetPort,
+                requestedDatabase);
+            
+            log.info("Connecting to backend database: {} with user: {}", dbUrl, targetUsername);
+            backendConnection = databaseConnectionService.connectToDatabase(
+                dbUrl, 
+                targetUsername, 
+                targetPassword
+            );
+            log.info("Successfully connected to backend database: {}", dbUrl);
+            
             // 直接发送认证成功消息，跳过密码验证
             log.info("Sending authentication sequence to client (user: {}, database: {})", 
-                authInfo.getUsername(), authInfo.getDatabase());
+                authInfo.getUsername(), requestedDatabase);
             
             log.debug("Step 1: Sending AuthenticationOk packet");
             byte[] authOkPacket = PostgreSQLPacket.createAuthenticationOkPacket();
@@ -110,7 +116,7 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             
             // Proxy communication between client and backend
             log.info("Starting proxy communication");
-            proxyConnection(clientSocket, clientIn, clientOut, backendConnection);
+            proxyConnection(clientSocket, clientIn, clientOut, backendConnection, requestedDatabase);
             log.info("Proxy communication ended");
         } catch (Exception e) {
             log.error("Error handling PostgreSQL client connection from {}", clientSocket.getRemoteSocketAddress(), e);
@@ -236,10 +242,28 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
         try {
             if (backendConnection != null && !backendConnection.isClosed()) {
                 DatabaseMetaData metaData = backendConnection.getMetaData();
-                int majorVersion = metaData.getDatabaseMajorVersion();
-                int minorVersion = metaData.getDatabaseMinorVersion();
-                serverVersion = majorVersion + "." + minorVersion;
-                log.debug("Backend PostgreSQL version: {}", serverVersion);
+                // 获取完整的版本字符串，如 "PostgreSQL 15.6"
+                String fullVersion = metaData.getDatabaseProductVersion();
+                
+                // 提取版本号部分（去掉"PostgreSQL"等前缀）
+                // 例如："PostgreSQL 15.6 on x86_64..." -> "15.6"
+                if (fullVersion != null) {
+                    // 尝试提取版本号
+                    String[] parts = fullVersion.split("\\s+");
+                    for (String part : parts) {
+                        if (part.matches("\\d+\\.\\d+.*")) {
+                            // 找到版本号格式的部分，只取主版本号和次版本号
+                            String[] versionParts = part.split("\\.");
+                            if (versionParts.length >= 2) {
+                                serverVersion = versionParts[0] + "." + versionParts[1];
+                            } else {
+                                serverVersion = versionParts[0] + ".0";
+                            }
+                            break;
+                        }
+                    }
+                }
+                log.debug("Backend PostgreSQL version: {} (from: {})", serverVersion, fullVersion);
             }
         } catch (SQLException e) {
             log.warn("Failed to get backend database version, using default: {}", serverVersion);
@@ -276,9 +300,65 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
     }
 
     /**
+     * 检查SQL是否包含数据库切换命令
+     * 在Navicat中，切换数据库会发送类似 "SELECT current_database()" 的查询
+     * 但实际切换是通过重新连接实现的
+     * 这里我们需要检测客户端是否在查询不同数据库的对象
+     */
+    private String checkDatabaseSwitch(byte[] messageBytes, String currentDatabase) {
+        try {
+            int queryLength = messageBytes.length;
+            if (queryLength > 0 && messageBytes[queryLength - 1] == 0) {
+                queryLength--;
+            }
+            String sqlQuery = new String(messageBytes, 0, queryLength, "UTF-8").trim();
+            
+            // 检查是否有 \c database 或 \connect database 命令（psql命令）
+            // 或者检查是否有显式的数据库切换
+            // 注意：Navicat通常通过重新连接来切换数据库，而不是发送SQL命令
+            // 所以这里主要是为了兼容psql等命令行工具
+            
+            return null; // 暂时不支持SQL级别的数据库切换
+        } catch (Exception e) {
+            log.debug("Error checking database switch: {}", e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * 切换到新的数据库
+     */
+    private Connection switchDatabase(Connection oldConnection, String newDatabase) throws SQLException {
+        // 关闭旧连接
+        if (oldConnection != null && !oldConnection.isClosed()) {
+            log.info("Closing connection to old database");
+            oldConnection.close();
+        }
+        
+        // 建立新连接
+        String dbUrl = String.format("jdbc:postgresql://%s:%d/%s", 
+            targetHost,
+            targetPort,
+            newDatabase);
+        
+        log.info("Switching to database: {}", newDatabase);
+        Connection newConnection = databaseConnectionService.connectToDatabase(
+            dbUrl, 
+            targetUsername, 
+            targetPassword
+        );
+        log.info("Successfully switched to database: {}", newDatabase);
+        
+        return newConnection;
+    }
+    
+    /**
      * Proxy communication between client and backend database.
      */
-    private void proxyConnection(Socket clientSocket, InputStream clientIn, OutputStream clientOut, Connection backendConnection) throws IOException {
+    private void proxyConnection(Socket clientSocket, InputStream clientIn, OutputStream clientOut, Connection backendConnection, String initialDatabase) throws IOException {
+        String currentDatabase = initialDatabase;
+        Connection connection = backendConnection;
+        
         try {
             while (!clientSocket.isClosed() && !Thread.currentThread().isInterrupted()) {
                 // 先读取消息类型（1字节）
@@ -324,27 +404,46 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                 // 根据消息类型处理
                 switch (messageType) {
                     case 'Q': // Simple query
-                        handleSimpleQuery(messageBytes, clientOut, backendConnection);
+                        // 检查是否需要切换数据库
+                        String newDatabase = checkDatabaseSwitch(messageBytes, currentDatabase);
+                        if (newDatabase != null && !newDatabase.equals(currentDatabase)) {
+                            try {
+                                connection = switchDatabase(connection, newDatabase);
+                                currentDatabase = newDatabase;
+                            } catch (SQLException e) {
+                                log.error("Failed to switch database to: {}", newDatabase, e);
+                                byte[] errorPacket = PostgreSQLPacket.createErrorResponsePacket("ERROR", "08006", 
+                                    "Failed to switch database: " + e.getMessage());
+                                clientOut.write(errorPacket);
+                                clientOut.flush();
+                                
+                                byte[] readyPacket = PostgreSQLPacket.createReadyForQueryPacket('I');
+                                clientOut.write(readyPacket);
+                                clientOut.flush();
+                                continue;
+                            }
+                        }
+                        handleSimpleQuery(messageBytes, clientOut, connection);
                         break;
                         
                     case 'P': // Parse
-                        handleParse(messageBytes, clientOut, backendConnection);
+                        handleParse(messageBytes, clientOut, connection);
                         break;
                         
                     case 'B': // Bind
-                        handleBind(messageBytes, clientOut, backendConnection);
+                        handleBind(messageBytes, clientOut, connection);
                         break;
                         
                     case 'E': // Execute
-                        handleExecute(messageBytes, clientOut, backendConnection);
+                        handleExecute(messageBytes, clientOut, connection);
                         break;
                         
                     case 'D': // Describe
-                        handleDescribe(messageBytes, clientOut, backendConnection);
+                        handleDescribe(messageBytes, clientOut, connection);
                         break;
                         
                     case 'C': // Close
-                        handleClose(messageBytes, clientOut, backendConnection);
+                        handleClose(messageBytes, clientOut, connection);
                         break;
                         
                     case 'S': // Sync
@@ -417,16 +516,7 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                 sqlQuery = "SET client_encoding TO 'UTF8'";
             }
             
-            // Navicat查询旧版本PostgreSQL的列datlastsysoid（已废弃）
-            // 在PostgreSQL 9.0+中，datlastsysoid已被移除，改写查询以兼容
-            if (upperQuery.contains("DATLASTSYSOID")) {
-                log.debug("Rewriting deprecated datlastsysoid query for compatibility");
-                // 在新版本中，可以用一个固定值代替（通常是10000）
-                // 或者查询 oid 列作为替代
-                sqlQuery = "SELECT DISTINCT 10000::oid as datlastsysoid FROM pg_database";
-            }
-            
-            // 执行SQL查询
+            // 执行SQL查询 - 直接透传到后端数据库
             Statement stmt = backendConnection.createStatement();
             boolean hasResultSet = stmt.execute(sqlQuery);
             
@@ -515,7 +605,9 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             clientOut.write(dataRowPacket);
             clientOut.flush();
             rowCount++;
+            log.debug("Sent row {}", rowCount);
         }
+        log.debug("Total rows sent: {}", rowCount);
         
         // 发送CommandComplete消息
         byte[] commandCompletePacket = PostgreSQLPacket.createCommandCompletePacket("SELECT " + rowCount);
