@@ -45,59 +45,138 @@ start-gateway.bat
 
 ## Usage
 
+### Configuration
+
+Edit `src/main/resources/application.yml` to configure the gateway:
+
+```yaml
+gateway:
+  # Database type: mysql or postgresql
+  proxy-db-type: postgresql
+  # Proxy port
+  proxy-port: 5433
+
+  # Target database configuration
+  target:
+    host: localhost
+    port: 5432
+    username: postgres
+    password: your_password
+    database: your_database
+```
+
 ### Connecting to the Gateway
 
-1. Configure your MySQL client to connect to localhost:3306
-2. When prompted, provide the target database connection details:
-   - Database URL (e.g., jdbc:mysql://target-db-server:3306/database)
-   - Username
-   - Password
-3. The gateway will proxy your connection to the target database
+#### MySQL Gateway
+
+```bash
+# Connect using MySQL client
+mysql -h localhost -P 3307 -u root -p
+
+# Enter the target database password when prompted
+```
+
+#### PostgreSQL Gateway
+
+```bash
+# Connect using psql client
+psql -h localhost -p 5433 -U postgres -d your_database
+
+# Or using connection string
+psql "postgresql://postgres:password@localhost:5433/your_database"
+```
 
 ### Example Usage
 
+#### MySQL Example
+
 ```bash
-# From a MySQL client
-mysql -h localhost -P 3306 -u anyuser -p
+# Connect to MySQL gateway
+mysql -h localhost -P 3307 -u root -p
 
-# The gateway will prompt for real database credentials
-Connected to Multi-Protocol Database Gateway
-Please provide database connection details:
-Database URL (e.g., jdbc:mysql://target-db-server:3306/database): jdbc:mysql://localhost:3306/myapp
-Username: app_user
-Password: ********
-
-# If credentials are valid
-Connection to database established. You can now send SQL commands.
+# Execute queries
+mysql> SHOW DATABASES;
+mysql> USE demo;
+mysql> SELECT * FROM users;
+mysql> INSERT INTO users (name, age) VALUES ('Alice', 25);
 ```
 
-## MySQL Protocol Implementation
+#### PostgreSQL Example
+
+```bash
+# Connect to PostgreSQL gateway
+psql -h localhost -p 5433 -U postgres -d dmp
+
+# Execute queries
+dmp=# \dt
+dmp=# SELECT * FROM users;
+dmp=# INSERT INTO users (name, age) VALUES ('Bob', 30);
+dmp=# CREATE TABLE test (id SERIAL PRIMARY KEY, name VARCHAR(100));
+```
+
+## Protocol Implementations
+
+### MySQL Protocol
 
 The gateway implements a substantial portion of the MySQL client-server protocol, including:
 
-### Handshake Phase
+#### Handshake Phase
 - Server greeting packet with protocol version, server version, and connection ID
 - Authentication packet parsing with capability flags and character set support
 - Secure password scrambling using MySQL 4.1+ authentication method
 
-### Command Phase
+#### Command Phase
 - SQL statement execution with result set handling
 - Column definition packets for metadata transmission
 - Row data packets for result transmission
 - OK and Error packet responses
 - EOF packet signaling
 
-### Supported Features
+#### Supported Features
 - Text protocol result sets
 - Basic data type mapping between MySQL and JDBC
 - Connection state management
 - Graceful connection termination
 
-### Limitations
+#### Limitations
 - Prepared statements are not yet implemented
 - SSL/TLS encryption is not yet supported
 - Advanced MySQL protocol features like compression are not implemented
 - Only basic authentication is supported
+
+### PostgreSQL Protocol
+
+The gateway implements the PostgreSQL wire protocol (version 3.0), including:
+
+#### Startup Phase
+- Startup message parsing with protocol version and parameters
+- SSL request handling (currently rejected)
+- Authentication flow (simplified, direct authentication)
+- Parameter status messages
+- Backend key data
+- ReadyForQuery messages
+
+#### Query Phase
+- Simple Query protocol for direct SQL execution
+- Extended Query protocol (Parse, Bind, Execute, Describe, Close, Sync)
+- Result set handling with RowDescription and DataRow messages
+- CommandComplete messages for DML/DDL operations
+- Error response messages
+
+#### Supported Features
+- SELECT queries with full result set support
+- INSERT, UPDATE, DELETE operations
+- DDL operations (CREATE, DROP, ALTER)
+- Multiple data types mapping (JDBC to PostgreSQL OID)
+- NULL value handling
+- Transaction status reporting
+
+#### Limitations
+- SSL/TLS encryption is not yet supported
+- Authentication is simplified (password verification skipped)
+- Extended query protocol is partially implemented
+- Transaction management is basic
+- Prepared statement caching is not implemented
 
 ## Project Structure
 
@@ -111,8 +190,14 @@ src/
 │   │       │   │   ├── MySQLPacket.java       # MySQL packet handling
 │   │       │   │   ├── MySQLHandshake.java    # MySQL handshake and authentication
 │   │       │   │   └── MySQLResultSet.java    # MySQL result set handling
-│   │       │   ├── MySqlProtocolAdapter.java  # MySQL protocol implementation
-│   │       │   └── ProtocolAdapter.java       # Protocol adapter interface
+│   │       │   ├── postgresql/    # PostgreSQL protocol specific classes
+│   │       │   │   ├── PostgreSQLPacket.java      # PostgreSQL packet handling
+│   │       │   │   ├── PostgreSQLHandshake.java   # PostgreSQL handshake and authentication
+│   │       │   │   └── PostgreSQLResultSet.java   # PostgreSQL result set handling
+│   │       │   ├── AbstractProtocolAdapter.java   # Abstract base class for adapters
+│   │       │   ├── MySqlProtocolAdapter.java      # MySQL protocol implementation
+│   │       │   ├── PostgreSQLProtocolAdapter.java # PostgreSQL protocol implementation
+│   │       │   └── ProtocolAdapter.java           # Protocol adapter interface
 │   │       ├── parser/            # SQL parsing functionality using Alibaba Druid
 │   │       │   ├── DruidSqlParser.java        # Druid-based SQL parser
 │   │       │   ├── SqlDialect.java            # SQL dialect enum

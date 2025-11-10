@@ -2,6 +2,7 @@ package com.whosly.gateway.adapter;
 
 import com.whosly.gateway.adapter.postgresql.PostgreSQLHandshake;
 import com.whosly.gateway.adapter.postgresql.PostgreSQLPacket;
+import com.whosly.gateway.adapter.postgresql.PostgreSQLResultSet;
 import com.whosly.gateway.parser.SqlParser;
 import com.whosly.gateway.parser.DruidSqlParser;
 import org.slf4j.Logger;
@@ -145,6 +146,7 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
         byte[] lengthBytes = new byte[4];
         int bytesRead = clientIn.read(lengthBytes);
         if (bytesRead < 4) {
+            log.warn("Failed to read message length, only got {} bytes", bytesRead);
             return null;
         }
         
@@ -153,10 +155,13 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                            ((lengthBytes[2] & 0xFF) << 8) |
                            (lengthBytes[3] & 0xFF);
         
+        log.debug("Received startup message with length: {}", messageLength);
+        
         // Check for SSL request (special case: length = 8, content = 0x04d2162f)
         if (messageLength == 8) {
             byte[] sslBytes = new byte[4];
             bytesRead = clientIn.read(sslBytes);
+            log.debug("Checking for SSL request: {} bytes read", bytesRead);
             if (bytesRead == 4 && 
                 sslBytes[0] == 0x04 && sslBytes[1] == 0xd2 && 
                 sslBytes[2] == 0x16 && sslBytes[3] == 0x2f) {
@@ -231,11 +236,21 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
     private void proxyConnection(Socket clientSocket, InputStream clientIn, OutputStream clientOut, Connection backendConnection) throws IOException {
         try {
             while (!clientSocket.isClosed() && !Thread.currentThread().isInterrupted()) {
-                // 读取客户端发送的消息
+                // 先读取消息类型（1字节）
+                int messageTypeByte = clientIn.read();
+                if (messageTypeByte == -1) {
+                    // 客户端断开连接
+                    log.debug("Client disconnected");
+                    return;
+                }
+                
+                char messageType = (char) messageTypeByte;
+                
+                // 读取消息长度（4字节）
                 byte[] lengthBytes = new byte[4];
                 int bytesRead = clientIn.read(lengthBytes);
-                if (bytesRead == -1) {
-                    // 客户端断开连接
+                if (bytesRead != 4) {
+                    log.warn("Failed to read message length, expected 4 bytes but got {}", bytesRead);
                     return;
                 }
                 
@@ -244,17 +259,24 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                                    ((lengthBytes[2] & 0xFF) << 8) |
                                    (lengthBytes[3] & 0xFF);
                 
-                // 如果消息长度为0，表示特殊消息
-                if (messageLength == 0) {
-                    continue;
+                // 读取消息内容（长度不包括类型字节，但包括长度字段本身）
+                byte[] messageBytes = new byte[messageLength - 4];
+                if (messageLength > 4) {
+                    int totalRead = 0;
+                    while (totalRead < messageBytes.length) {
+                        int read = clientIn.read(messageBytes, totalRead, messageBytes.length - totalRead);
+                        if (read == -1) {
+                            log.warn("Unexpected end of stream while reading message");
+                            return;
+                        }
+                        totalRead += read;
+                    }
                 }
                 
-                byte[] messageBytes = new byte[messageLength - 4];
-                clientIn.read(messageBytes);
+                log.debug("Received message type: '{}' (0x{}), length: {}", 
+                    messageType, Integer.toHexString(messageTypeByte), messageLength);
                 
-                // 检查消息类型
-                char messageType = (char) messageBytes[0];
-                
+                // 根据消息类型处理
                 switch (messageType) {
                     case 'Q': // Simple query
                         handleSimpleQuery(messageBytes, clientOut, backendConnection);
@@ -272,6 +294,14 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                         handleExecute(messageBytes, clientOut, backendConnection);
                         break;
                         
+                    case 'D': // Describe
+                        handleDescribe(messageBytes, clientOut, backendConnection);
+                        break;
+                        
+                    case 'C': // Close
+                        handleClose(messageBytes, clientOut, backendConnection);
+                        break;
+                        
                     case 'S': // Sync
                         handleSync(clientOut);
                         break;
@@ -282,10 +312,15 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                         
                     default:
                         // 对于其他消息，返回一个错误响应
-                        log.debug("Received unknown message type: {}, returning error", messageType);
+                        log.debug("Received unknown message type: '{}' (0x{})", messageType, Integer.toHexString(messageTypeByte));
                         byte[] errorPacket = PostgreSQLPacket.createErrorResponsePacket("ERROR", "0A000", 
                             "Unsupported message type: " + messageType);
                         clientOut.write(errorPacket);
+                        clientOut.flush();
+                        
+                        // 发送ReadyForQuery
+                        byte[] readyPacket = PostgreSQLPacket.createReadyForQueryPacket('I');
+                        clientOut.write(readyPacket);
                         clientOut.flush();
                         break;
                 }
@@ -303,6 +338,11 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
                     "Server Error: " + e.getMessage());
                 clientOut.write(errorPacket);
                 clientOut.flush();
+                
+                // 发送ReadyForQuery
+                byte[] readyPacket = PostgreSQLPacket.createReadyForQueryPacket('I');
+                clientOut.write(readyPacket);
+                clientOut.flush();
             } catch (IOException ioException) {
                 log.debug("Failed to send error packet to client: {}", ioException.getMessage());
             }
@@ -314,14 +354,63 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
      */
     private void handleSimpleQuery(byte[] messageBytes, OutputStream clientOut, Connection backendConnection) throws IOException {
         try {
-            // 提取SQL查询（去掉消息类型字节，以null结尾）
-            String sqlQuery = new String(messageBytes, 1, messageBytes.length - 2); // -2 to remove type and null terminator
+            // 提取SQL查询（以null结尾）
+            int queryLength = messageBytes.length;
+            if (queryLength > 0 && messageBytes[queryLength - 1] == 0) {
+                queryLength--; // 去掉null终止符
+            }
+            String sqlQuery = new String(messageBytes, 0, queryLength, "UTF-8").trim();
             log.info("Received SQL query: {}", sqlQuery);
             
-            // 在实际实现中，这里应该解析和执行SQL查询
-            // 为简化起见，我们直接返回命令完成包
-            byte[] commandCompletePacket = PostgreSQLPacket.createCommandCompletePacket("SELECT 0");
-            clientOut.write(commandCompletePacket);
+            // 执行SQL查询
+            Statement stmt = backendConnection.createStatement();
+            boolean hasResultSet = stmt.execute(sqlQuery);
+            
+            if (hasResultSet) {
+                // 有结果集，发送结果
+                ResultSet rs = stmt.getResultSet();
+                sendResultSet(rs, clientOut);
+                rs.close();
+            } else {
+                // 没有结果集（UPDATE/INSERT/DELETE等）
+                int updateCount = stmt.getUpdateCount();
+                String commandTag;
+                
+                // 根据SQL类型确定命令标签
+                String upperQuery = sqlQuery.toUpperCase().trim();
+                if (upperQuery.startsWith("INSERT")) {
+                    commandTag = "INSERT 0 " + updateCount;
+                } else if (upperQuery.startsWith("UPDATE")) {
+                    commandTag = "UPDATE " + updateCount;
+                } else if (upperQuery.startsWith("DELETE")) {
+                    commandTag = "DELETE " + updateCount;
+                } else if (upperQuery.startsWith("CREATE")) {
+                    commandTag = "CREATE TABLE";
+                } else if (upperQuery.startsWith("DROP")) {
+                    commandTag = "DROP TABLE";
+                } else if (upperQuery.startsWith("ALTER")) {
+                    commandTag = "ALTER TABLE";
+                } else {
+                    commandTag = "SELECT " + updateCount;
+                }
+                
+                byte[] commandCompletePacket = PostgreSQLPacket.createCommandCompletePacket(commandTag);
+                clientOut.write(commandCompletePacket);
+                clientOut.flush();
+            }
+            
+            stmt.close();
+            
+            // 发送ReadyForQuery包
+            byte[] readyForQueryPacket = PostgreSQLPacket.createReadyForQueryPacket('I');
+            clientOut.write(readyForQueryPacket);
+            clientOut.flush();
+            
+        } catch (SQLException e) {
+            log.error("SQL error executing query", e);
+            byte[] errorPacket = PostgreSQLPacket.createErrorResponsePacket("ERROR", "42000", 
+                "SQL Error: " + e.getMessage());
+            clientOut.write(errorPacket);
             clientOut.flush();
             
             // 发送ReadyForQuery包
@@ -338,6 +427,69 @@ public class PostgreSQLProtocolAdapter extends AbstractProtocolAdapter {
             // 发送ReadyForQuery包
             byte[] readyForQueryPacket = PostgreSQLPacket.createReadyForQueryPacket('I');
             clientOut.write(readyForQueryPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 发送结果集到客户端
+     */
+    private void sendResultSet(ResultSet rs, OutputStream clientOut) throws SQLException, IOException {
+        ResultSetMetaData metaData = rs.getMetaData();
+        int columnCount = metaData.getColumnCount();
+        
+        // 发送RowDescription消息
+        byte[] rowDescPacket = PostgreSQLResultSet.createRowDescriptionPacket(metaData, columnCount);
+        clientOut.write(rowDescPacket);
+        clientOut.flush();
+        
+        // 发送DataRow消息
+        int rowCount = 0;
+        while (rs.next()) {
+            byte[] dataRowPacket = PostgreSQLResultSet.createDataRowPacket(rs, columnCount);
+            clientOut.write(dataRowPacket);
+            clientOut.flush();
+            rowCount++;
+        }
+        
+        // 发送CommandComplete消息
+        byte[] commandCompletePacket = PostgreSQLPacket.createCommandCompletePacket("SELECT " + rowCount);
+        clientOut.write(commandCompletePacket);
+        clientOut.flush();
+    }
+    
+    /**
+     * 处理Describe消息
+     */
+    private void handleDescribe(byte[] messageBytes, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 发送NoData响应
+            byte[] noDataPacket = PostgreSQLPacket.createPacket('n');
+            clientOut.write(noDataPacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling Describe message", e);
+            byte[] errorPacket = PostgreSQLPacket.createErrorResponsePacket("ERROR", "XX000", 
+                "Error: " + e.getMessage());
+            clientOut.write(errorPacket);
+            clientOut.flush();
+        }
+    }
+    
+    /**
+     * 处理Close消息
+     */
+    private void handleClose(byte[] messageBytes, OutputStream clientOut, Connection backendConnection) throws IOException {
+        try {
+            // 发送CloseComplete响应
+            byte[] closeCompletePacket = PostgreSQLPacket.createPacket('3');
+            clientOut.write(closeCompletePacket);
+            clientOut.flush();
+        } catch (Exception e) {
+            log.error("Error handling Close message", e);
+            byte[] errorPacket = PostgreSQLPacket.createErrorResponsePacket("ERROR", "XX000", 
+                "Error: " + e.getMessage());
+            clientOut.write(errorPacket);
             clientOut.flush();
         }
     }

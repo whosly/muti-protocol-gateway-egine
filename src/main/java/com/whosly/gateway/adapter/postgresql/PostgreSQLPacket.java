@@ -1,9 +1,8 @@
 package com.whosly.gateway.adapter.postgresql;
 
 import java.io.ByteArrayOutputStream;
-import java.sql.Connection;
-import java.sql.DatabaseMetaData;
-import java.sql.SQLException;
+import java.nio.charset.StandardCharsets;
+import java.sql.*;
 
 /**
  * PostgreSQL协议数据包处理类
@@ -299,10 +298,10 @@ public class PostgreSQLPacket {
         // 消息类型：'C' (CommandComplete)
         baos.write('C');
         
-        byte[] tagBytes = commandTag.getBytes();
+        byte[] tagBytes = commandTag.getBytes(StandardCharsets.UTF_8);
         
-        // 消息长度（类型(1) + 长度(4) + 标签长度 + null终止符(1)）
-        int messageLength = 4 + 1 + tagBytes.length + 1;
+        // 消息长度（长度(4) + 标签长度 + null终止符(1)）
+        int messageLength = 4 + tagBytes.length + 1;
         baos.write((messageLength >> 24) & 0xFF);
         baos.write((messageLength >> 16) & 0xFF);
         baos.write((messageLength >> 8) & 0xFF);
